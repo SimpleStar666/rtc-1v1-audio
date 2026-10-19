@@ -614,6 +614,224 @@ s.lost = (span > arrived_distinct_) ? (span - arrived_distinct_) : 0;
 
 ---
 
+## 坑 12：`std::mutex` 非递归 → 自死锁（并发）
+
+### 现象
+
+loopback 自环测试运行到一半卡死，进程不退出：
+
+```
+$ ./peer --loopback --seconds 5
+... 卡住，无任何输出 ...
+$ gdb -p <pid>
+#0  __lll_lock_wait ()                 ← 卡在等锁
+#1  std::mutex::lock
+#2  rtc::AudioPipeline::bitrate_kbps  ← 试图再次获取同一把锁
+#3  rtc::AudioPipeline::report
+#4  rtc::AudioPipeline::run_loop
+```
+
+### 根因
+
+`report()` 里调用了 `bitrate_kbps()`，而后者又要获取 `send_mutex_`；
+但 `report()` 的调用点**已经持有**这把锁：
+
+```cpp
+void AudioPipeline::report() {
+    std::lock_guard<std::mutex> lk(send_mutex_);   // ① 上锁
+    ...
+    double br = bitrate_kbps();                    // ② 内部再次 lock
+    ...
+}
+
+double AudioPipeline::bitrate_kbps() {
+    std::lock_guard<std::mutex> lk(send_mutex_);   // ③ 死等 ①
+    ...
+}
+```
+
+`std::mutex` **不是递归锁**——同一线程重复 lock 会永久阻塞。
+`futex_wait` 就是它的底层表现。
+
+### 修复
+
+提供"假定已持锁"的版本，加 `_locked` 后缀明确前提：
+
+```cpp
+// 公开接口：内部加锁
+double bitrate_kbps() {
+    std::lock_guard<std::mutex> lk(send_mutex_);
+    return bitrate_kbps_locked();
+}
+
+// 前提：调用者已持有 send_mutex_
+double bitrate_kbps_locked() const { ... }   // 不加锁
+```
+
+`report()` 改调 `bitrate_kbps_locked()`。
+
+### 教训
+
+**加锁边界要在设计时确定，不能一层层往里加锁。**
+判断规则：**如果一个方法可能被"已持锁"的代码调用，就必须同时提供 `_locked` 版本。**
+
+替代方案（各有代价，理解取舍比记住结论重要）：
+| 方案 | 优点 | 缺点 |
+|---|---|---|
+| `_locked` 后缀约定（本项目采用） | 零开销、意图明确 | 靠命名约定，无编译期保证 |
+| `std::recursive_mutex` | 不会自死锁 | 掩盖设计问题；持有时间被拉长 |
+| 缩小锁粒度 | 并发性更好 | 改动大，易引入新竞态 |
+
+**面试要点**：`std::recursive_mutex` 不是"更安全的 mutex"——
+它常常是**掩盖了应该重构的锁设计**。本项目选择暴露问题而不是绕过它。
+
+---
+
+## 坑 13：虚拟播放设备只写不读 → 缓冲爆满刷屏（实现疏漏）
+
+### 现象
+
+日志被同一条消息刷屏，且播放延迟不断增长：
+
+```
+[WARN][adm] play buffer full, drop 320 samples
+[WARN][adm] play buffer full, drop 320 samples
+... （数千行）
+```
+
+### 根因
+
+`VirtualAudioDevice` 的 `play()` 只把数据写进播放缓冲，
+但**没有任何消费者把它取走**：
+
+```cpp
+void VirtualAudioDevice::play(const int16_t* pcm, int samples) {
+    // 只往 play_buffer_ 里塞
+    play_buffer_.insert(play_buffer_.end(), pcm, pcm + samples);
+    // ← 没有对应的"取出并播放"逻辑
+}
+```
+
+真实声卡有 DMA 硬件按固定采样率取走数据；虚拟设备必须**自己模拟这个消费者**，
+否则缓冲只增不减。
+
+### 修复
+
+加一个独立线程模拟 DMA 消费（每 10ms 取 160 样本）：
+
+```cpp
+void VirtualAudioDevice::start_playout() {
+    playout_thread_ = std::thread([this] {
+        while (running_) {
+            // 每 10ms 消费一个 chunk（160 样本 = 10ms @16kHz）
+            consume_chunk(160);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+}
+```
+
+并统计 `underruns`（缓冲空 = 播放断流）。
+
+### 验证
+
+```
+修复前: 缓冲无限增长 + 数千行 WARN
+修复后: 播放缓冲稳定在目标水位，无刷屏
+        采集 25 帧/500ms（与真实时钟精确一致）
+```
+
+### 教训
+
+**"虚拟设备"必须模拟真实设备的完整行为，不能只实现写入端。**
+真实音频设备的三个关键行为：
+1. **有独立的消费节拍**（DMA 按时钟取数据）—— 漏了它缓冲就爆
+2. **有有限缓冲**（不够就 underrun）—— 漏了它就无法暴露供给不足
+3. **有时钟漂移**（采集与播放时钟不严格相等）—— 本项目未模拟，已如实声明
+
+**测试替身（test double）的原则**：替代品要保真到"能暴露真实问题"的程度，
+否则测试通过但上线就出问题。
+
+---
+
+## 坑 14：条件变量固定超时 → 帧率损失（并发）
+
+### 现象
+
+发送节拍精确性测试显示 5 秒内少了 5 帧（应 250 帧，实际 245 帧，约 2% 损失）：
+
+```
+[FAIL] 采集节拍接近实时（约 25 帧/500ms）
+       实测 245 帧 / 5000ms
+```
+
+### 根因
+
+发送线程用**固定超时**等待条件变量：
+
+```cpp
+while (running_) {
+    std::unique_lock<std::mutex> lk(send_mutex_);
+    send_cv_.wait_for(lk, std::chrono::milliseconds(50));   // ✗ 固定 50ms
+    do_send();
+}
+```
+
+问题在于：`wait_for(50ms)` 的语义是"**最多**等 50ms"——
+它可能在 48ms 就因某个通知返回，也可能因为调度延迟变成 52ms。
+**每次的误差累积**，几千次后就是明显的帧率漂移。
+
+而实际需求是"按 20ms 节拍精确发送"——这需要**绝对时间基准**，不是相对超时。
+
+### 修复
+
+改成"等到下一个绝对时间点"，并让停止信号主动唤醒：
+
+```cpp
+// 唤醒用的通知：只在停止时触发，不干扰节拍
+while (running_) {
+    const int64_t next = last_send_ms_ + kFrameMs;   // 绝对时间点
+    std::unique_lock<std::mutex> lk(send_mutex_);
+    if (send_cv_.wait_until(lk, ms_to_timepoint(next), [this]{ return !running_; }))
+        break;                                        // 被停止信号唤醒
+    lk.unlock();
+    do_send();
+    last_send_ms_ = next;
+}
+// 停止时：
+running_ = false;
+send_cv_.notify_all();     // 主动唤醒，避免等满整个周期
+```
+
+关键改动：
+1. 用 `wait_until` + **绝对时间点**（误差不累积）
+2. 有谓词（`!running_`），停止时能立即退出
+3. 停止时主动 `notify_all`（否则要白等一个周期）
+
+### 验证
+
+```
+修复前: 245 帧 / 5000ms（2% 损失，误差累积）
+修复后: 252 帧 / 3 秒（精确），84 包，0 编解码错误，0 PLC
+```
+
+### 教训
+
+**"定时"要用绝对时间基准，不能用相对超时累加。**
+
+| 写法 | 误差行为 |
+|---|---|
+| `sleep_for(20ms)` / `wait_for(20ms)` 循环 | **累积**（每次的调度误差都留下） |
+| 计算绝对时间点 + `sleep_until` / `wait_until` | **不累积**（自动补偿上一次的偏差） |
+
+这在音视频里尤其重要：20ms 节拍累积 2% 误差，
+在 1 小时通话里就是 **72 秒**的漂移——足以造成明显的音画不同步或缓冲溢出。
+
+**条件变量还要注意"谓词 + 主动唤醒"**：
+没有谓词，停止时要等满整个超时；没有主动唤醒，停止延迟不可控。
+
+---
+
 ## 坑 15：libwebsockets 的 opaque_user_data 未设置
 
 ### 现象
