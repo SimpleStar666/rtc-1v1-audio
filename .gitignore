@@ -1,0 +1,25 @@
+# 构建产物
+build/
+*.o
+*.a
+*.so
+
+# 日志与临时文件
+*.log
+cfg.log
+c.log
+b.log
+cmake_configure.log
+build.log
+
+# 音频输出
+*.pcm
+*.wav
+
+# 编辑器
+.vscode/
+.idea/
+compile_commands.json
+
+# 系统
+.DS_Store
