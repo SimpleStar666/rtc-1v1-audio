@@ -9,14 +9,22 @@
 
 | 层 | 选用组件 | 对应 WebRTC 中的 | 状态 |
 |---|---|---|---|
-| 音频编解码 | **Opus** (libopus) | Opus 编解码器 | ✅ 已实现并验证 |
-| 抖动缓冲 / 播放调度 | 自研 | **NetEq** | ✅ 已实现并验证 |
-| 音频设备 | 自研虚拟设备 | **ADM** | ✅ 已实现并验证 |
-| 信令 | **libwebsockets** | WebSocket 信令（标准不规定） | ✅ 两端配对已跑通 |
-| NAT 穿透 | **libnice** | ICE / STUN (RFC 8445/5389) | ✅ 实测拿到 srflx 候选 |
-| 媒体加密 | **OpenSSL DTLS** + **libsrtp2** | DTLS-SRTP (RFC 5764) | ✅ 21 项验证通过 |
-| 抗丢包 | 自研 | NACK / ULPFEC | ✅ 抖动缓冲侧已实现 |
-| 拥塞控制 | 自研 | GCC | ⬜ Phase 5 |
+| 音频编解码 | **Opus** (libopus) | Opus 编解码器 | ✅ SNR 29.8dB |
+| 抖动缓冲 / 播放调度 | 自研 | **NetEq** | ✅ 丢包检测精确吻合 |
+| 音频设备 | 自研虚拟设备 | **ADM** | ✅ 节拍无漂移 |
+| 信令 | **libwebsockets** | WebSocket 信令（标准不规定） | ✅ 两端配对零丢失 |
+| NAT 穿透 | **libnice** | ICE / STUN (RFC 8445/5389) | ✅ srflx×3 |
+| 媒体加密 | **OpenSSL DTLS** + **libsrtp2** | DTLS-SRTP (RFC 5764) | ✅ 21 项通过 |
+| 抗丢包 | 自研 | NACK / ULPFEC | ✅ 恢复率 100%/89%/78%/52% |
+| 拥塞控制 | 自研 | GCC | ✅ 升/降/恢复全通过 |
+
+**端到端链路**（Phase 6 验收）：
+
+```
+采集 → Opus 编码 → 打包(RTP 兼容头) → FEC 冗余 → SRTP 加密
+  → ICE 通道(UDP) ──网络──▶ ICE 接收 → SRTP 解密 → NACK/FEC 恢复
+  → 抖动缓冲(NetEq) → Opus 解码 → 播放
+```
 
 ## 为什么不用 libwebrtc
 
@@ -88,26 +96,28 @@ cd rtc-1v1-audio
   Opus SNR 29.8 dB（16kbps），实测码率 16.0 kbps，算法延迟 26.9ms
   采集节拍 25 帧/500ms（精确无漂移）
 
-弱网矩阵（5 用例）：检测丢包与实际丢包逐一吻合
+弱网矩阵：检测丢包与实际丢包逐一吻合
   0%  丢包 → 检测 0        2%  → 检测 6  （实际 6）
   8%  丢包 → 检测 38       15% → 检测 67 （实际 67）
-  ±80ms 抖动 0 丢包 → 检测 0，接受率 99.8%
-
-端到端 loopback：84 包全部收发，0 编解码错误，0 PLC
 
 ICE 穿透：
-  host 候选场景：各 6 个候选，候选对选通，双向收发确认内容来自对端
-  STUN 场景：host×6 srflx×3 relay×0（成功获取公网映射候选）
+  host 候选：各 6 个候选，候选对选通，双向收发确认内容来自对端
+  STUN：host×6 srflx×3 relay×0（成功获取公网映射候选）
 
 DTLS-SRTP（21 项全部通过）：
-  协商套件 ECDHE-RSA-AES256-GCM-SHA384
-  双向证书指纹互验通过
-  RFC 5764 密钥四方一致（client/server key + salt）
-  SRTP 加密 35→45 字节（+10 字节认证标签），解密内容与明文一致
+  套件 ECDHE-RSA-AES256-GCM-SHA384，双向指纹互验
+  RFC 5764 密钥四方一致，加密 35→45 字节（+10 认证标签）
   篡改密文被拒 / 未加密明文包被拒
 
-信令配对（两端 + 服务器）：
-  joined / peer_ready / offer / answer / candidate 双向零丢失
+弱网对抗恢复率（NACK + FEC）：
+  2% 丢包 → 100.0%     5% 丢包 → 89.3%
+  10% 丢包 → 77.8%     20% 丢包 → 51.7%
+拥塞控制：良好网络 16000→27417，排队 →13136，高丢包 →7099，恢复 →45774 bps
+
+端到端集成（音频经 ICE + DTLS-SRTP）：
+  无丢包：SRTP 加密/解密 62/62，解密失败 0，PLC 0，解码最大幅度 8218
+  丢包矩阵：模拟丢弃 3/4/6 → 检测丢包 3/4/6（精确吻合）
+            PLC 补偿 9/12/18（随丢包率上升）
 ```
 
 ## 进度
@@ -117,8 +127,18 @@ DTLS-SRTP（21 项全部通过）：
 - [x] **Phase 2**：WebSocket 信令（客户端 + 服务器，两端配对跑通）
 - [x] **Phase 3**：libnice ICE / STUN 穿透（实测拿到 srflx 候选）
 - [x] **Phase 4**：DTLS-SRTP 媒体加密（21 项验证通过）
-- [ ] Phase 5：弱网对抗（NACK / FEC / 拥塞控制）
-- [ ] Phase 6：端到端联调（音频经 ICE+SRTP 通道）+ 指标统计
+- [x] **Phase 5**：弱网对抗（NACK / FEC / 拥塞控制）
+- [x] **Phase 6**：端到端集成（音频经 ICE + DTLS-SRTP 完整链路）
+
+## 已知边界（如实声明）
+
+| 项目 | 现状 | 原因 |
+|---|---|---|
+| 真实声卡采集/播放 | 用虚拟设备替代 | WSL 无 `/dev/snd` |
+| 真实 3A（AEC/ANS/AGC） | 未实现 | 无真实麦克风回采信号 |
+| 跨公网 NAT 穿透 | 本机验证通过 | 无第二台公网主机 |
+| TURN 中继 | 未实现 | 无对应场景需求 |
+| 硬件时钟漂移 | 未模拟 | 虚拟设备时钟理想 |
 
 ## 目录结构
 
@@ -126,12 +146,13 @@ DTLS-SRTP（21 项全部通过）：
 src/
   common/    日志、字节序、CRC32 等工具
   media/     Opus 封装、抖动缓冲（NetEq）、虚拟设备（ADM）、音频管线
-  protocol/  包格式（RTP 映射）、信令消息（JSON）
+  protocol/  RTP 兼容包格式、信令消息（JSON）
   signal/    WebSocket 信令服务器 + 客户端
   ice/       ICE / STUN 穿透（libnice 封装）
   crypto/    DTLS-SRTP 加密（OpenSSL + libsrtp2）
+  net/       弱网对抗（NACK / FEC / 拥塞控制）
   app/       通话端点（--loopback / --peer-test 两种模式）
-docs/        架构 / 进度 / 踩坑（27 项）/ 验证
-tests/       自检、弱网、ICE、DTLS-SRTP 测试
+docs/        架构 / 进度 / 踩坑（30 项）/ 验证
+tests/       自检、弱网、ICE、DTLS-SRTP、抗损、端到端
 scripts/     构建、诊断与验证脚本
 ```
