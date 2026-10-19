@@ -571,14 +571,75 @@ grep -A40 "坑 23" docs/02-pitfalls.md | head -45
 
 ## 11. 常见问题
 
+### Q0（最常见）：`build.log: Permission denied` 编译失败
+
+**完整报错长这样**：
+
+```
+ts@DESKTOP:~/rtc-1v1-audio$ ./scripts/run.sh build
+
+=== 编译 ===
+./scripts/run.sh: line 54: build.log: Permission denied
+  ✗ 编译失败，见 build/build.log
+```
+
+**原因**：`build/` 目录（或整个仓库）**不属于你**，通常是因为之前有人用
+`sudo` 或 `root` 身份在这个目录里编译过，留下的文件属于 root。
+
+**一条命令修好**：
+
+```bash
+# 在仓库根目录执行
+sudo rm -rf build
+sudo chown -R $(id -un):$(id -gn) .
+```
+
+然后重新跑 `./scripts/run.sh build`。
+
+**自己确认一下**（修复前后对比）：
+
+```bash
+ls -ld build          # 看所有者是不是你
+# 修复前: drwxr-xr-x 3 root root  .../build     ← root 的，你不能写
+# 修复后: drwxrwxr-x 3 ts   ts    .../build     ← 你的
+```
+
+> 新版 `run.sh` 已内置权限自检，会**直接告诉你所有者是谁、怎么修**，
+> 不会再抛含糊的 `Permission denied`。
+
+---
+
 ### Q1：`cmake` 版本太低（3.16）
+
+Ubuntu 20.04 自带 cmake 3.16，而本项目要求 ≥ 3.21。
 
 ```bash
 python3 -m pip install --user "cmake>=3.28"
-export PATH=$HOME/.local/bin:$PATH
+export PATH="$HOME/.local/bin:$PATH"
+
+# 验证
+which cmake        # 应该是 /home/<你>/.local/bin/cmake
+cmake --version    # 应该是 4.x
 ```
 
-本项目脚本已内置这个 PATH 处理，手动敲 cmake 时才需要。
+**关键**：`pip install --user` 装到**当前用户**的 `~/.local/bin`。
+如果你之前用 `sudo` 装过，那只有 root 能用，你的 `~/.local/bin` 还是空的。
+
+**注意 `which -a cmake`** —— 如果它列出多个，确认排在最前的是新版：
+
+```bash
+$ which -a cmake
+/home/ts/.local/bin/cmake     ← 希望是这个（新版）
+/usr/bin/cmake                ← 系统自带 3.16
+```
+
+本项目 `run.sh` 会自动把 `~/.local/bin` 加到 PATH 前面，
+并且会**先检查版本**，不满足就直接告诉你缺什么。
+
+> 新版 `run.sh` 已内置版本自检，会打印 `✗ cmake 版本过低：3.16.3（需要 >= 3.21）`
+> 和修复命令，不会让你对着 `CMake Error` 自己猜。
+
+---
 
 ### Q2：编译报 `-DCMAKE_POLICY_VERSION_MINIMUM` 相关错误
 

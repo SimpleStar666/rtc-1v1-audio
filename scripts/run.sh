@@ -42,17 +42,127 @@ check_env() {
 }
 
 # ---------- 编译 ----------
+#
+# 权限与工具链自检（都是实际踩过的坑）：
+#
+#  坑 A（权限）：
+#    如果 build/ 或仓库目录不属于当前用户（典型原因：之前用 sudo/root 编译过），
+#    那么 `mkdir -p build` 会**静默成功**（目录已存在），
+#    但接着 `> build.log` 就报 "Permission denied"，
+#    真正的错误信息还被重定向吞掉了，用户只看到莫名其妙的一行。
+#
+#  坑 B（cmake 版本）：
+#    Ubuntu 20.04 自带的 cmake 是 3.16，而本项目要求 >= 3.21。
+#    如果新版 cmake 只装在别人的 home 里（比如 root 的 ~/.local），
+#    普通用户用不到，会报 "CMake 3.21 or higher is required"。
+#
+# 本函数在动手之前就检测这两件事，并给出可直接复制执行的修复命令。
+# 见 docs/02-pitfalls.md 坑 35 / 坑 36。
+check_cmake_version() {
+  local min_major=3 min_minor=21
+  if ! command -v cmake >/dev/null 2>&1; then
+    err "找不到 cmake"
+    echo "      修复: python3 -m pip install --user \"cmake>=3.28\""
+    return 1
+  fi
+  local ver maj rest minor
+  ver=$(cmake --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  maj=${ver%%.*}
+  rest=${ver#*.}
+  minor=${rest%%.*}
+  if [ -z "$ver" ]; then
+    warn "无法解析 cmake 版本，继续尝试"
+    return 0
+  fi
+  if [ "${maj:-0}" -gt "$min_major" ] || \
+     { [ "${maj:-0}" -eq "$min_major" ] && [ "${minor:-0}" -ge "$min_minor" ]; }; then
+    return 0
+  fi
+  err "cmake 版本过低：$ver（需要 >= ${min_major}.${min_minor}）"
+  echo "      cmake 路径: $(command -v cmake)"
+  echo ""
+  echo -e "      ${C_B}修复方法${C_0}"
+  echo "        python3 -m pip install --user \"cmake>=3.28\""
+  echo "        export PATH=\"\$HOME/.local/bin:\$PATH\""
+  echo ""
+  echo -e "      ${C_D}说明：Ubuntu 20.04 自带的 cmake 是 3.16，不满足本项目要求。${C_0}"
+  echo -e "      ${C_D}      装好后 ~/.local/bin/cmake 才是新版，必须让它排在 PATH 前面。${C_0}"
+  return 1
+}
+
+check_writable() {
+  local dir="$1" label="$2"
+  # 目录不存在时检查其父目录
+  if [ ! -d "$dir" ]; then
+    dir=$(dirname "$dir")
+  fi
+  if [ ! -w "$dir" ]; then
+    err "$label 不可写：$dir"
+    local owner
+    owner=$(ls -ld "$dir" 2>/dev/null | awk '{print $3":"$4}')
+    echo "      所有者: ${owner:-未知}    当前用户: $(id -un)"
+    echo ""
+    echo -e "      ${C_B}修复方法（任选其一）${C_0}"
+    echo "        sudo rm -rf build"
+    echo "        sudo chown -R $(id -un):$(id -gn) ."
+    echo ""
+    echo -e "      ${C_D}原因：通常是因为之前用 sudo 或 root 身份编译过，${C_0}"
+    echo -e "      ${C_D}      留下的文件属于 root，普通用户无法覆盖。${C_0}"
+    return 1
+  fi
+  return 0
+}
+
 do_build() {
   title "编译"
+  # 新版 cmake 通常在 ~/.local/bin，优先用它
   export PATH="$HOME/.local/bin:$PATH"
-  mkdir -p "$BUILD"
-  cd "$BUILD"
-  if [ ! -f CMakeCache.txt ]; then
-    cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 > cmake.log 2>&1 \
-      || { err "cmake 配置失败，见 build/cmake.log"; tail -15 cmake.log; return 1; }
+
+  # ---- 自检 1：cmake 版本 ----
+  check_cmake_version || return 1
+
+  # ---- 自检 2：目录权限 ----
+  check_writable "$ROOT" "仓库目录" || return 1
+  if [ -e "$BUILD" ]; then
+    check_writable "$BUILD" "build 目录" || return 1
+    # 目录可写但旧日志文件可能属于其他用户 → 尝试能否截断
+    if [ -e "$BUILD/build.log" ] && ! ( : > "$BUILD/build.log" ) 2>/dev/null; then
+      err "build/build.log 不可写（可能属于其他用户）"
+      echo "      修复：sudo rm -rf build"
+      return 1
+    fi
   fi
-  cmake --build . -j"$(nproc)" > build.log 2>&1 \
-    || { err "编译失败，见 build/build.log"; grep -E 'error:' build.log | head -10; return 1; }
+
+  mkdir -p "$BUILD" 2>/dev/null
+  if [ ! -d "$BUILD" ]; then
+    err "无法创建 build 目录：$BUILD"
+    return 1
+  fi
+  cd "$BUILD" || return 1
+
+  # ---- 配置 ----
+  if [ ! -f CMakeCache.txt ]; then
+    echo -e "  ${C_D}cmake $(cmake --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')  首次配置...${C_0}"
+    if ! cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+         > cmake.log 2>&1; then
+      err "cmake 配置失败，日志：build/cmake.log"
+      tail -20 cmake.log | sed 's/^/      /'
+      # 配置失败会留下半成品缓存，下次会报
+      # "could not find CMAKE_PROJECT_NAME in Cache" —— 清掉，避免误导
+      rm -f CMakeCache.txt
+      echo -e "      ${C_D}已清理失败的 CMakeCache.txt（避免影响下次配置）${C_0}"
+      return 1
+    fi
+  fi
+
+  # ---- 编译 ----
+  echo -e "  ${C_D}编译中（-j$(nproc)）...${C_0}"
+  if ! cmake --build . -j"$(nproc)" > build.log 2>&1; then
+    err "编译失败，日志：build/build.log"
+    grep -E 'error:|Error' build.log | head -12 | sed 's/^/      /'
+    return 1
+  fi
+
   ok "编译成功（产物在 build/）"
   ls -1 selftest weaknet_test peer signal_server ice_test dtls_srtp_test \
         loss_protection_test metrics_test e2e_test 2>/dev/null | sed 's/^/      /'
