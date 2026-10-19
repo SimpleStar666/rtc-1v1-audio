@@ -68,7 +68,39 @@ public:
     // 解析并设置远端候选（来自信令）
     bool set_remote_sdp(const std::string& sdp_fragment);
 
-    // 设置远端凭证（SDP 片段里也包含，但明文接口便于调试）
+    // ------------------------------------------------------------------
+    // Trickle ICE —— 候选边收集边发送，不必等收集完成
+    //
+    // 为什么重要（面试高频）：
+    //   非 Trickle 模式要等所有候选收集完（含 STUN 往返，可能几秒）
+    //   才开始交换 SDP，建链延迟高。
+    //   Trickle ICE 让每个候选一产生就发出去，对端立刻开始连通性检查，
+    //   把建链时间从"最慢候选"降到"最先可用的候选"。
+    //
+    // 本接口对应 WebRTC 的 onicecandidate 事件 + addIceCandidate()。
+    // ------------------------------------------------------------------
+
+    // 设置"每产生一个本地候选就回调"的处理器（对应 onicecandidate）
+    using TrickleCallback = std::function<void(const std::string& candidate_sdp)>;
+    void set_on_trickle_candidate(TrickleCallback cb) { on_trickle_ = std::move(cb); }
+
+    // 增量添加一个远端候选（对应 addIceCandidate）。
+    // candidate_sdp 为单个候选的 SDP 片段（a=candidate:... 或含 a= 行）。
+    bool add_remote_candidate_sdp(const std::string& candidate_sdp);
+
+    // 已通过 trickle 收集到的本地候选数
+    int trickled_count() const { return trickled_count_; }
+
+    // 本地 ICE 凭证（Trickle ICE 时需随 SDP 一起交换，
+    // 因为单个候选片段里不含 ufrag/pwd）
+    struct Credentials {
+        std::string ufrag;
+        std::string pwd;
+        bool valid() const { return !ufrag.empty() && !pwd.empty(); }
+    };
+    Credentials local_credentials() const;
+
+    // 设置远端凭证（Trickle ICE 建链的必要步骤）
     void set_remote_credentials(const std::string& ufrag, const std::string& pwd);
 
     // 发送媒体数据（在候选对选通后有效）
@@ -106,6 +138,9 @@ private:
     static void cb_component_state(NiceAgent* agent, unsigned int stream_id,
                                    unsigned int component_id, unsigned int state,
                                    void* user_data);
+    static void cb_new_candidate(NiceAgent* agent, unsigned int stream_id,
+                                 unsigned int component_id, char* foundation,
+                                 void* user_data);   // Trickle ICE
     static void cb_recv(NiceAgent* agent, unsigned int stream_id, unsigned int component_id,
                         unsigned int len, char* buf, void* user_data);
 
@@ -118,6 +153,8 @@ private:
     RecvCallback      on_recv_;
     CandidateCallback on_candidate_;
     StateCallback     on_state_;
+    TrickleCallback   on_trickle_;      // Trickle ICE：每个新候选的回调
+    int               trickled_count_ = 0;
 
     std::atomic<bool> gathering_done_{false};
     std::atomic<bool> connected_{false};

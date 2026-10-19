@@ -137,6 +137,36 @@ void IceTransport::cb_recv(NiceAgent* agent, unsigned int stream_id, unsigned in
     self->handle_incoming(reinterpret_cast<uint8_t*>(buf), len);
 }
 
+// Trickle ICE：每产生一个新本地候选就立刻回调出去。
+//
+// 对应 WebRTC 的 onicecandidate 事件——候选一产生就发信令，
+// 不等收集完成。这能把建链时间从"最慢候选"缩短到"最先可用候选"。
+void IceTransport::cb_new_candidate(NiceAgent* agent, unsigned int stream_id,
+                                    unsigned int component_id, char* foundation,
+                                    void* user_data) {
+    auto* self = static_cast<IceTransport*>(user_data);
+
+    // 用 libnice 的 API 把这个候选转成 SDP 片段（a=candidate:...）
+    GSList* cands = nice_agent_get_local_candidates(agent, stream_id, component_id);
+    if (!cands) return;
+
+    for (GSList* it = cands; it; it = it->next) {
+        auto* c = static_cast<NiceCandidate*>(it->data);
+        gchar* sdp = nice_agent_generate_local_candidate_sdp(agent, c);
+        if (!sdp) continue;
+
+        self->trickled_count_++;
+        LOGI(kTag, "trickle candidate #%d: %s", self->trickled_count_,
+             sdp[0] ? sdp : "?");
+
+        if (self->on_trickle_) {
+            self->on_trickle_(std::string(sdp));
+        }
+        g_free(sdp);
+    }
+    g_slist_free_full(cands, reinterpret_cast<GDestroyNotify>(nice_candidate_free));
+}
+
 // ---------------- 初始化 ----------------
 bool IceTransport::init(const Config& cfg) {
     if (agent_) {
@@ -216,6 +246,9 @@ bool IceTransport::init(const Config& cfg) {
                      G_CALLBACK(cb_new_selected_pair), this);
     g_signal_connect(G_OBJECT(agent_), "component-state-changed",
                      G_CALLBACK(cb_component_state), this);
+    // Trickle ICE：候选一产生就回调（对应 onicecandidate）
+    g_signal_connect(G_OBJECT(agent_), "new-candidate",
+                     G_CALLBACK(cb_new_candidate), this);
 
     // glib 主循环：用我们自己的 ctx_（与 agent 共用），
     // 这样 libnice 的 socket source 才能被真正迭代。见上方 ★ 说明。
@@ -296,10 +329,55 @@ bool IceTransport::set_remote_sdp(const std::string& sdp_fragment) {
     return true;
 }
 
+IceTransport::Credentials IceTransport::local_credentials() const {
+    Credentials c;
+    if (!agent_) return c;
+    gchar* ufrag = nullptr;
+    gchar* pwd = nullptr;
+    nice_agent_get_local_credentials(agent_, cfg_.stream_id, &ufrag, &pwd);
+    if (ufrag) { c.ufrag = ufrag; g_free(ufrag); }
+    if (pwd)   { c.pwd = pwd;     g_free(pwd); }
+    return c;
+}
+
 void IceTransport::set_remote_credentials(const std::string& ufrag, const std::string& pwd) {
     if (!agent_) return;
     nice_agent_set_remote_credentials(agent_, cfg_.stream_id, ufrag.c_str(), pwd.c_str());
     LOGI(kTag, "remote credentials set");
+}
+
+// 增量添加一个远端候选（Trickle ICE 的 addIceCandidate）。
+//
+// 与 set_remote_sdp 的区别：
+//   set_remote_sdp        一次性把整段 SDP 解析进来（非 trickle 模式）
+//   add_remote_candidate_sdp  来一个候选就加一个，立即开始连通性检查
+bool IceTransport::add_remote_candidate_sdp(const std::string& candidate_sdp) {
+    if (!agent_ || candidate_sdp.empty()) return false;
+
+    // libnice 的 parse_remote_candidate_sdp 解析**单个**候选，
+    // 返回 NiceCandidate*（不是 GSList —— 这点容易搞错，
+    // 因为旁边的 parse_remote_stream_sdp 返回的才是 GSList）。
+    // 见 docs/02-pitfalls.md 坑 31。
+    NiceCandidate* c = nice_agent_parse_remote_candidate_sdp(
+        agent_, cfg_.stream_id, candidate_sdp.c_str());
+    if (!c) {
+        LOGW(kTag, "parse_remote_candidate_sdp failed for: %.60s", candidate_sdp.c_str());
+        return false;
+    }
+
+    // 包成单元素 GSList 提交给 agent
+    GSList* list = g_slist_append(nullptr, c);
+    const int added = nice_agent_set_remote_candidates(
+        agent_, cfg_.stream_id, kComponentRtp, list);
+    g_slist_free(list);
+    nice_candidate_free(c);
+
+    if (added < 0) {
+        LOGE(kTag, "set_remote_candidates failed: %d", added);
+        return false;
+    }
+    LOGI(kTag, "trickle: added %d remote candidate(s)", added);
+    return true;
 }
 
 // ---------------- 媒体收发 ----------------

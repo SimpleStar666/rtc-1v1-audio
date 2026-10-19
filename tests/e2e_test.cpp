@@ -37,6 +37,7 @@
 #include "ice/ice_transport.h"
 #include "media/jitter_buffer.h"
 #include "media/opus_codec.h"
+#include "metrics/metrics.h"
 #include "net/loss_protection.h"
 #include "protocol/packet.h"
 
@@ -91,6 +92,10 @@ public:
         std::lock_guard<std::mutex> lk(mutex_);
         for (size_t i = 0; i < len; i++) queue_.push_back(data[i]);
     }
+
+    bool connected() const { return ice_->connected(); }
+    uint64_t rx_count() const { return ice_->rx_count(); }
+    uint64_t tx_count() const { return ice_->tx_count(); }
 
 private:
     IceTransport*       ice_;
@@ -156,6 +161,7 @@ int main(int argc, char** argv) {
     NackRequester nack;
     FecEncoder fec_enc(FecEncoder::Config{4, 1});
     FecDecoder fec_dec;
+    MetricsCollector metrics;      // 统一指标采集（对应 WebRTC getStats）
 
     // 统一的接收处理：先看是不是 SRTP（RTP 版本位 = 2），
     // 不是则当作 DTLS 记录交给握手侧。
@@ -166,14 +172,17 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> buf(data, data + len);
             int blen = int(buf.size());
             if (sb.unprotect(buf.data(), &blen)) {
+                metrics.on_srtp(false, true);
                 PacketHeader ph;
                 std::vector<uint8_t> pp;
                 if (Packet::parse(buf.data(), size_t(blen), &ph, &pp)) {
                     recv_packets++;
+                    metrics.on_packet_received(size_t(blen));
                     nack.on_packet(ph.seq, -1);
                     if (ph.flags & kFlagFecPacket) {
                         std::vector<std::pair<uint16_t, std::vector<uint8_t>>> rec;
                         fec_dec.on_fec(pp.data(), pp.size(), &rec);
+                        metrics.on_recovered_fec(fec_dec.stats().recovered);
                         // FEC 包用独立 SSRC（session_id=2），
                         // 其序号空间与媒体流不同，**不能**喂给 NACK 统计，
                         // 否则会把两个序号空间混在一起导致丢包统计虚高。
@@ -191,6 +200,7 @@ int main(int argc, char** argv) {
                 }
             } else {
                 decrypted_fail++;
+                metrics.on_srtp(false, false);
             }
         } else {
             // DTLS 记录：喂给握手侧
@@ -261,7 +271,9 @@ int main(int argc, char** argv) {
             }
 
             uint8_t enc[OpusCodec::kMaxFrameBytes];
+            metrics.on_frame_captured();
             int n = codec_a.encode(pcm.data(), frame_samples, enc, sizeof(enc));
+            metrics.on_frame_encoded(n > 0, n > 0 ? size_t(n) : 0);
             if (n > 0) {
                 group.emplace_back(enc, enc + n);
             }
@@ -304,7 +316,13 @@ int main(int argc, char** argv) {
                     memcpy(srtp_buf, wire, size_t(total));
                     int slen = total;
                     if (sa.protect(srtp_buf, &slen)) {
-                        if (ice_a.send(srtp_buf, size_t(slen))) sent_ok++;
+                        metrics.on_srtp(true, true);
+                        if (ice_a.send(srtp_buf, size_t(slen))) {
+                            sent_ok++;
+                            metrics.on_packet_sent(size_t(total), false);
+                        }
+                    } else {
+                        metrics.on_srtp(true, false);
                     }
                 }
 
@@ -328,7 +346,13 @@ int main(int argc, char** argv) {
                         if (ftotal > 0) {
                             int flen = ftotal;
                             if (sa.protect(fwire, &flen)) {
-                                if (ice_a.send(fwire, size_t(flen))) fec_sent++;
+                                metrics.on_srtp(true, true);
+                                if (ice_a.send(fwire, size_t(flen))) {
+                                    fec_sent++;
+                                    metrics.on_packet_sent(size_t(ftotal), true);
+                                }
+                            } else {
+                                metrics.on_srtp(true, false);
                             }
                         }
                     }
@@ -360,6 +384,7 @@ int main(int argc, char** argv) {
                     }
                     if (n > 0) {
                         decoded_ok++;
+                        metrics.on_frame_decoded(true);
                         last_decoded = out;
                         // ★ 幅度检查必须看**所有**解码帧的最大值，而不是只看最后一帧。
                         //   最后一帧可能正好是 PLC 产生的静音帧（PLC 用舒适噪声，
@@ -369,6 +394,8 @@ int main(int argc, char** argv) {
                             const int a = abs(int(out[i]));
                             if (a > max_decoded_amp) max_decoded_amp = a;
                         }
+                    } else {
+                        metrics.on_frame_decoded(false);
                     }
                 }
             }
@@ -417,6 +444,46 @@ int main(int argc, char** argv) {
     const int max_amp = max_decoded_amp.load();
     printf("  解码后最大幅度    : %d\n", max_amp);
     CHECK(max_amp > 1000, "解码出的音频有合理幅度（非静音）");
+
+    // ================= 6. 统一指标统计 =================
+    //
+    // 对应 WebRTC 的 getStats()：把各层数据汇总成一份可上报的指标。
+    printf("\n=== 6. 统一指标统计（对应 getStats）===\n");
+    metrics.on_jb_stats(jst.received, jst.played, jst.plc, jst.late,
+                        jst.cur_target_ms);
+    metrics.on_jitter(jst.avg_jitter_ms);
+    metrics.on_packets_lost(nst.lost_detected);
+    metrics.on_recovered_nack(nst.recovered);
+    metrics.on_nack_request(nst.nack_sent);
+    metrics.on_ice(ice_a.tx_count(), ice_b.rx_count(),
+                   ice_a.connected() && ice_b.connected());
+
+    CallMetrics cm = metrics.snapshot();
+    printf("%s\n", cm.to_string().c_str());
+
+    // 指标自洽性校验（跨层交叉验证）
+    printf("  -- 跨层自洽性校验 --\n");
+    printf("    发送包(SRTP加密)=%llu  接收包(SRTP解密)=%llu\n",
+           (unsigned long long)cm.srtp_protected,
+           (unsigned long long)cm.srtp_unprotected);
+    CHECK(cm.srtp_protected == cm.srtp_unprotected,
+          "SRTP 加密次数 == 解密次数（无丢包时逐包对应）");
+    CHECK(cm.packets_sent + cm.fec_packets_sent == cm.srtp_protected,
+          "发出的媒体+FEC 包数 == SRTP 加密次数");
+
+    const double mrec = cm.recovery_rate();
+    printf("    恢复率=%.1f%%  仍缺失=%llu\n",
+           mrec * 100.0, (unsigned long long)cm.still_missing());
+    CHECK(mrec >= 0.0 && mrec <= 1.0, "恢复率落在 [0,1] 区间");
+
+    const double mcont = cm.playout_continuity();
+    printf("    播放连续性=%.1f%%\n", mcont * 100.0);
+    CHECK(mcont > 0.5, "播放连续性 > 50%");
+
+    // JSON 输出可被上报
+    const std::string js = cm.to_json();
+    CHECK(js.find("\"bitrate_bps\"") != std::string::npos, "指标可导出为 JSON");
+    printf("    JSON 长度: %zu 字节\n", js.size());
 
     ice_a.close();
     ice_b.close();

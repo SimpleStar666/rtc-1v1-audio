@@ -162,6 +162,101 @@ int main(int argc, char** argv) {
     a.close();
     b.close();
 
+    // ================= 6. Trickle ICE =================
+    //
+    // 验证"候选边收集边发送"：新候选一产生就通过回调送出，
+    // 不必等 collecting 完成。对应 WebRTC 的 onicecandidate。
+    printf("\n=== 4. Trickle ICE（候选增量发送）===\n");
+    {
+        IceTransport ta, tb;
+        std::atomic<int> a_trickled{0}, b_trickled{0};
+        std::atomic<int> a_connected{0}, b_connected{0};
+        std::vector<std::string> a_cands, b_cands;
+        std::mutex cm;
+
+        ta.set_on_trickle_candidate([&](const std::string& sdp) {
+            std::lock_guard<std::mutex> lk(cm);
+            a_cands.push_back(sdp);
+            a_trickled++;
+        });
+        tb.set_on_trickle_candidate([&](const std::string& sdp) {
+            std::lock_guard<std::mutex> lk(cm);
+            b_cands.push_back(sdp);
+            b_trickled++;
+        });
+
+        IceTransport::Config tca;
+        tca.stream_id = 1; tca.controlling = true;
+        IceTransport::Config tcb = tca; tcb.controlling = false;
+
+        ta.init(tca);
+        tb.init(tcb);
+        ta.wait_gathering_done(8000);
+        tb.wait_gathering_done(8000);
+
+        printf("    A 通过 trickle 送出候选: %d 个\n", a_trickled.load());
+        printf("    B 通过 trickle 送出候选: %d 个\n", b_trickled.load());
+        CHECK(a_trickled.load() > 0, "A 侧产生了 trickle 候选回调");
+        CHECK(b_trickled.load() > 0, "B 侧产生了 trickle 候选回调");
+
+        // ★ Trickle ICE 的关键补充：**必须交换 ICE 凭证（ufrag/pwd）**。
+        //
+        // 单个候选片段（a=candidate:...）里**不含** ufrag 与 pwd ——
+        // 它们原本在 SDP 的 a=ice-ufrag / a=ice-pwd 行里。
+        // 只做 trickle 候选交换而不交换凭证，连通性检查的 STUN 报文中
+        // 就没有正确的用户名/密码，ICE 永远无法完成 →
+        // 表现为"候选都加成功了，但连接建不起来"。
+        // 见 docs/02-pitfalls.md 坑 31。
+        const auto ac = ta.local_credentials();
+        const auto bc = tb.local_credentials();
+        printf("    A 凭证: ufrag=%s (pwd %zu 字节)\n",
+               ac.ufrag.c_str(), ac.pwd.size());
+        printf("    B 凭证: ufrag=%s (pwd %zu 字节)\n",
+               bc.ufrag.c_str(), bc.pwd.size());
+        CHECK(ac.valid() && bc.valid(), "双方都产出了 ICE 凭证");
+        tb.set_remote_credentials(ac.ufrag, ac.pwd);
+        ta.set_remote_credentials(bc.ufrag, bc.pwd);
+
+        // 用 trickle 方式逐个添加远端候选（对应 addIceCandidate）
+        {
+            std::lock_guard<std::mutex> lk(cm);
+            int ok = 0;
+            for (const auto& sdp : b_cands) {
+                if (ta.add_remote_candidate_sdp(sdp)) ok++;
+            }
+            printf("    A 逐个添加 B 的候选: %d/%zu 成功\n", ok, b_cands.size());
+            CHECK(ok > 0, "A 通过 add_remote_candidate_sdp 增量添加远端候选成功");
+            ok = 0;
+            for (const auto& sdp : a_cands) {
+                if (tb.add_remote_candidate_sdp(sdp)) ok++;
+            }
+            printf("    B 逐个添加 A 的候选: %d/%zu 成功\n", ok, a_cands.size());
+            CHECK(ok > 0, "B 通过 add_remote_candidate_sdp 增量添加远端候选成功");
+        }
+
+        // Trickle 模式下也应能建立连接
+        CHECK(ta.wait_connected(10000), "Trickle 模式下 A 连接建立");
+        CHECK(tb.wait_connected(10000), "Trickle 模式下 B 连接建立");
+
+        // 验证 trickle 后能真正传数据
+        ta.set_on_recv([&](const uint8_t*, size_t) { a_connected++; });
+        tb.set_on_recv([&](const uint8_t*, size_t) { b_connected++; });
+        for (int i = 0; i < 20; i++) {
+            const char* msg = "TRICKLE_TEST";
+            ta.send(reinterpret_cast<const uint8_t*>(msg), strlen(msg) + 1);
+            tb.send(reinterpret_cast<const uint8_t*>(msg), strlen(msg) + 1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        printf("    Trickle 建链后收发: A 收 %d / B 收 %d\n",
+               a_connected.load(), b_connected.load());
+        CHECK(a_connected.load() > 0 && b_connected.load() > 0,
+              "Trickle ICE 建链后可正常收发媒体");
+
+        ta.close();
+        tb.close();
+    }
+
     printf("\n################ 结果：%s（失败 %d 项）################\n",
            g_fail == 0 ? "全部通过" : "存在失败", g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -86,8 +86,15 @@ add_library(rtc_net STATIC
 target_include_directories(rtc_net PUBLIC src)
 target_link_libraries(rtc_net PUBLIC rtc_common)
 
+# ---------- 指标统计 ----------
+add_library(rtc_metrics STATIC
+  src/metrics/metrics.cpp
+)
+target_include_directories(rtc_metrics PUBLIC src)
+target_link_libraries(rtc_metrics PUBLIC rtc_common)
+
 # ---------- 可执行目标（按阶段逐个加入）----------
-set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol rtc_signal rtc_ice rtc_crypto rtc_net pthread)
+set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol rtc_signal rtc_ice rtc_crypto rtc_net rtc_metrics pthread)
 
 add_executable(selftest tests/selftest.cpp)
 target_link_libraries(selftest PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES} ${SRTP2_LIBRARIES})
@@ -126,3 +133,6 @@ target_link_libraries(e2e_test PRIVATE ${RTC_EXE_LINK}
 target_include_directories(e2e_test PRIVATE
   ${OPUS_INCLUDE_DIRS} ${SRTP2_INCLUDE_DIRS} ${NICE_INCLUDE_DIRS}
   ${GLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+
+add_executable(metrics_test tests/metrics_test.cpp)
+target_link_libraries(metrics_test PRIVATE ${RTC_EXE_LINK})
