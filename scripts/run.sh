@@ -65,11 +65,29 @@ do_test() {
   cd "$BUILD"
   local fail=0
   run() {
-    printf "  %-26s" "$1"; shift
-    local out; out=$(timeout 120 "$@" 2>&1); local rc=$?
-    local last; last=$(echo "$out" | grep -E "结果：" | tail -1 | sed 's/^#* *//')
-    [ -n "$last" ] && echo "$last" || { echo "rc=$rc"; }
-    [ $rc -ne 0 ] && fail=$((fail+1))
+    local name="$1"; shift
+    printf "  %-26s" "$name"
+    local out rc
+    out=$(timeout 120 "$@" 2>&1); rc=$?
+    local last
+    last=$(echo "$out" | grep -E "结果：" | tail -1 | sed 's/^#* *//')
+    if [ -n "$last" ]; then
+      # 有汇总行的（selftest / ice / dtls / loss / metrics / e2e）
+      if echo "$last" | grep -q "全部通过"; then
+        printf '%b\n' "${C_G}${last}${C_0}"
+      else
+        printf '%b\n' "${C_R}${last}${C_0}"
+        fail=$((fail+1))
+      fi
+    else
+      # 无汇总行的（weaknet / loopback）：用退出码判断
+      if [ $rc -eq 0 ]; then
+        printf '%b\n' "${C_G}✓ 通过（组件自打印结果，无汇总行）${C_0}"
+      else
+        printf '%b\n' "${C_R}✗ 失败（退出码 $rc）${C_0}"
+        fail=$((fail+1))
+      fi
+    fi
   }
   run "媒体层自检"      ./selftest
   run "弱网矩阵"        ./weaknet_test --loss 8 --jitter 30 --delay 60 --seconds 8
