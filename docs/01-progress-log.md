@@ -314,10 +314,120 @@ forwarded candidate  peer#1 -> peer#2  (88 bytes)
 
 ---
 
-## 下一步（Phase 3+）
+## Phase 3：libnice ICE / STUN 穿透
 
-- [ ] Phase 3：libnice ICE / STUN 穿透（替换候选占位地址，打通真实 UDP 媒体通道）
-- [ ] Phase 4：DTLS-SRTP 加密（libsrtp2 + OpenSSL）
+### 做了什么
+
+1. 实现 `IceTransport`（libnice 封装）：候选收集、交换、连通性检查、媒体收发
+2. 实现 `ice_test`：两个 agent 在同机建立真实 UDP 候选对并双向传输
+3. 用 tcpdump 抓包定位了 STUN 收不到响应的疑难问题
+
+### 实测结果（host 候选）
+
+```
+=== 1. 候选收集 ===
+  A/B 各产生 6 个候选（SDP 538 字节）
+  候选类型: host×6 srflx×0 relay×0
+
+=== 2. 候选交换与连通性检查 ===
+  B 设置 A 的候选 ✓
+  A 设置 B 的候选 ✓
+  A/B 均选出可用候选对，component 状态 -> READY ✓
+
+=== 3. 双向媒体传输（4 秒）===
+  A 收到 39 包 / 692 字节，内容: PKT_FROM_B seq=38  ✓
+  B 收到 40 包 / 710 字节，内容: PKT_FROM_A seq=39  ✓
+  双向都确认"收到的数据确实来自对端"
+```
+
+### STUN 打洞验证（带公网 STUN）
+
+```
+[INFO][ice] STUN configured: stun.l.google.com (74.125.250.129):19302
+A 候选类型: host×6 srflx×3 relay×0     ← 成功获得 3 个公网映射候选
+```
+
+**srflx 候选 = 公网映射地址**，这是 STUN 打洞的核心产出。
+
+### 本阶段踩的坑（4 个，累计 24 个）
+
+| # | 坑 | 定位方式 |
+|---|---|---|
+| 21 | 头文件暴露 glib 类型 | 编译错误 |
+| 22 | `nice_agent_set_remote_candidates_done` 在 0.1.16 不存在 | grep 头文件 |
+| **23** | **agent 与主循环上下文不一致** | **tcpdump 抓包**（见下） |
+| **24** | stun-server 只接受 IP + IPv6 优先 | 从二进制字符串找文档 |
+
+### 坑 23 的完整定位过程（本项目最难的一个）
+
+**现象**：STUN 配置正确、网络可达，但永远拿不到 srflx 候选（`host×6 srflx×0`），
+且 gathering 在 0.2 秒内就"完成"——远快于 STUN 往返应有的时间。
+
+**四步排查（逐步缩小范围）**：
+
+```
+① 裸 socket 手工发 STUN Binding Request
+   → 收到 32 字节响应          ⇒ 网络可达，排除网络问题
+
+② 开启 libnice 内部日志（G_MESSAGES_DEBUG=all）
+   → "STUN transaction retransmitted (timeout 397ms)" 反复出现
+                              ⇒ 请求发出了，但"收不到"响应
+
+③ tcpdump 抓包（决定性证据）
+   192.168.0.197.45878 > 74.125.250.129.19302: UDP, length 20  ← 请求发出
+   74.125.250.129.19302 > 192.168.0.197.45878: UDP, length 32  ← 响应回来了！
+                              ⇒ 响应到达网卡却未被处理，问题在事件循环层
+
+④ 检查 glib 上下文：
+   agent  = nice_agent_new(g_main_context_default())   // default 上下文
+   loop   = g_main_loop_new(NULL, FALSE)               // thread-default 上下文
+                              ⇒ 两者不匹配！libnice 的 socket source 挂在前者，
+                                而主循环迭代后者 → socket 事件永不分发
+```
+
+**修复**：让 agent 与主循环共用一个显式创建的上下文：
+
+```cpp
+ctx_   = g_main_context_new();
+agent_ = nice_agent_new(ctx_, NICE_COMPATIBILITY_RFC5245);
+loop_  = g_main_loop_new(ctx_, FALSE);
+nice_agent_attach_recv(agent_, stream, comp, ctx_, cb, this);
+```
+
+**验证**：
+```
+修复前: host×6 srflx×0 relay×0
+修复后: host×6 srflx×3 relay×0     ← 公网映射候选收集成功
+```
+
+### 坑 24 的定位（配置被静默忽略）
+
+```bash
+# 从动态库字符串里找到属性文档（比查在线文档更可靠，版本差异就在二进制里）
+$ strings libnice.so.10 | grep -i "STUN server"
+"The IP address (not the hostname) of the STUN server to use"
+                                       ↑ 只接受 IP，传域名会被静默忽略
+```
+
+同时 `getent hosts stun.l.google.com` 返回的是 **IPv6**，而 WSL 的 IPv6 出网不通。
+修复：自己做一次强制 IPv4 的 `getaddrinfo`（`ai_family = AF_INET`）。
+
+### 与 WebRTC 的对应
+
+| 本项目 | WebRTC | 说明 |
+|---|---|---|
+| `IceTransport::init` + gather | `RTCPeerConnection` + ICE gathering | 候选收集 |
+| `local_sdp()` | `localDescription` 的 `a=candidate` 行 | 本地候选 |
+| `set_remote_sdp()` | `setRemoteDescription` + `addIceCandidate` | 远端候选 |
+| `new-selected-pair` 信号 | `iceConnectionState === 'connected'` | 选通候选对 |
+| `nice_agent_send()` | RTP 发包（经 DTLS-SRTP 加密） | 媒体传输 |
+| host / srflx / relay | 三类候选（优先级 host > srflx > relay） | 候选类型 |
+
+---
+
+## 下一步（Phase 4+）
+
+- [ ] Phase 4：DTLS-SRTP 加密（libsrtp2 + OpenSSL）—— 把 ICE 通道上的明文换成加密媒体
 - [ ] Phase 5：弱网对抗（NACK / FEC / 拥塞控制）
-- [ ] Phase 6：端到端联调 + 指标上报
+- [ ] Phase 6：端到端联调（音频经 ICE 通道传输）+ 指标上报
 

@@ -1,6 +1,6 @@
 # 踩坑记录
 
-> 真实遇到的报错、误判和修复过程，共 20 个坑。
+> 真实遇到的报错、误判和修复过程，共 24 个坑。
 > 这些是最有价值的部分——面试时"你踩过什么坑"考的就是这些。
 
 **速览**：
@@ -27,9 +27,14 @@
 | 18 | **`lws_write` 未预留 LWS_PRE** | C/C++ 混用 | 堆越界崩溃 |
 | 19 | **消息竞态导致误判超时** | 时序 | 偶发失败 |
 | 20 | **发送缓冲覆盖式赋值** | 时序 | 消息丢失 |
+| 21 | 头文件暴露 glib 类型 | C/C++ 混用 | 编译失败 |
+| 22 | libnice 版本 API 差异 | 库版本 | 编译失败 |
+| 23 | **agent 与主循环上下文不一致** ⭐ | **事件循环** | **收不到 STUN 响应** |
+| 24 | **stun-server 只接受 IP / IPv6 优先** | 库配置语义 | 静默忽略配置 |
 
-**Phase 1 最值得讲的三个：坑 9、坑 10、坑 11**（算法与可测试性）
-**Phase 2 最值得讲的四个：坑 16、坑 17、坑 18、坑 20**（C 库与 C++ 混用）
+**Phase 1 最值得讲：坑 9、10、11**（算法与可测试性）
+**Phase 2 最值得讲：坑 16、17、18、20**（C 库与 C++ 混用）
+**Phase 3 最值得讲：坑 23、24**（事件循环 + 配置语义，定位难度最高）
 
 ---
 
@@ -890,14 +895,245 @@ case LWS_CALLBACK_SERVER_WRITEABLE: {
 
 ---
 
-## 汇总：这 20 个坑的类型分布
+## 坑 21：libnice 回调签名在头文件中引入 glib 类型
+
+### 现象
+
+```
+error: 'guint' has not been declared
+error: 'gpointer' has not been declared
+error: no declaration matches 'void rtc::IceTransport::cb_gathering_done(NiceAgent*, guint, gpointer)'
+```
+
+### 根因
+
+头文件里声明的静态回调用了 `guint` / `gchar` / `gpointer`（glib 的 typedef），
+但头文件不应引入 glib 依赖（会污染所有包含者）。
+另外 `nice_agent.h` 里用的 guint 与头文件里的声明必须 ABI 一致才能匹配。
+
+### 修复
+
+头文件用标准 C 类型（glib 的 `guint` 就是 `unsigned int`，`gchar` 是 `char`，
+`gpointer` 是 `void*`——ABI 完全等价）：
+
+```cpp
+// 头文件
+static void cb_gathering_done(NiceAgent* agent, unsigned int stream_id, void* user_data);
+static void cb_new_selected_pair(NiceAgent* agent, unsigned int stream_id,
+                                 unsigned int component_id, char* lfoundation,
+                                 char* rfoundation, void* user_data);
+```
+
+实现文件里 `#include <glib.h>` 后可以用 glib 类型，但为了一致性也用标准类型。
+
+### 教训
+
+**跨模块的头文件不要把第三方库的类型暴露出去**（除非该库是接口的一部分）。
+用 ABI 等价的标准类型既避免依赖传播，也不会影响链接。
+
+---
+
+## 坑 22：libnice 版本间 API 差异
+
+### 现象
+
+```
+error: 'nice_agent_set_remote_candidates_done' was not declared in this scope
+```
+
+### 根因
+
+`nice_agent_set_remote_candidates_done()` 是 **libnice 更新版本**的 API，
+Ubuntu 20.04 自带的 **0.1.16 里不存在**。
+
+### 修复
+
+删掉这次调用即可——`nice_agent_parse_remote_sdp()` **本身就完成了
+"设置远端候选 + 启动连通性检查"**两件事，不需要额外通知。
+
+### 教训
+
+**对着系统实际安装的头文件写代码**，不要按最新文档写。
+查阅版本差异的方式：
+
+```bash
+grep -n "nice_agent_set_remote" /usr/include/nice/agent.h
+```
+
+更普遍地说：跨版本兼容时，先用 `grep` 确认 API 是否存在再写。
+
+---
+
+## 坑 23：agent 与 glib 主循环的上下文不一致 → STUN 响应收不到（★★★ 最难定位）
+
+### 现象
+
+STUN 配置正确、网络可达，但**永远拿不到 srflx 候选**：
+
+```
+A 候选类型: host×6 srflx×0 relay×0
+```
+
+而 `gathering` 在 0.2 秒内就"完成"了——远快于 STUN 往返应有的时间。
+
+### 定位过程（一步步排除）
+
+**(1) 确认网络可达**（裸 socket 能拿到 STUN 响应）
+```python
+s.sendto(stun_binding_request, ("stun.l.google.com", 19302))
+# 收到 32 字节响应 → UDP 出网正常
+```
+
+**(2) 开启 libnice 内部日志**，看到关键线索：
+```
+libnice-stun-DEBUG: STUN transaction retransmitted (timeout 397ms).
+libnice-stun-DEBUG: STUN transaction retransmitted (timeout 795ms).
+...
+```
+**STUN 请求发出去了，但在不断重传** —— 说明响应"没收到"。
+
+**(3) tcpdump 抓包 —— 这一步给出了决定性证据**：
+```
+192.168.0.197.45878 > 74.125.250.129.19302: UDP, length 20   ← 请求发出
+74.125.250.129.19302 > 192.168.0.197.45878: UDP, length 32   ← 响应回来了！
+192.168.0.197.45878 > 74.125.250.129.19302: UDP, length 20   ← 却又重传
+```
+**响应明明到达了网卡，libnice 却说没收到。**
+
+**(4) 定位根因**：上下文不一致。
+
+```cpp
+// 旧代码
+agent_ = nice_agent_new(g_main_context_default(), ...);  // agent 挂在 default 上下文
+loop_  = g_main_loop_new(NULL, FALSE);                   // 主循环迭代 thread-default
+                                                          // ← 不是同一个上下文！
+```
+
+libnice 把它的 socket source 挂在 `default` 上下文上，而主循环迭代的是
+**thread-default** 上下文。结果：socket 可读事件永远不被分发，
+数据包躺在内核缓冲区里，agent 读不到 → 超时重传。
+
+### 修复
+
+**让 agent 与主循环共用一个显式创建的上下文**：
+
+```cpp
+ctx_ = g_main_context_new();                          // 自己创建
+agent_ = nice_agent_new(ctx_, NICE_COMPATIBILITY_RFC5245);
+loop_  = g_main_loop_new(ctx_, FALSE);                // 同一个 ctx
+nice_agent_attach_recv(agent_, stream, comp, ctx_, cb, this);   // 也传 ctx_
+```
+
+### 验证
+
+```
+修复前: A 候选类型: host×6 srflx×0 relay×0
+修复后: A 候选类型: host×6 srflx×3 relay×0    ← 拿到 3 个公网映射候选
+```
+
+### 教训
+
+**glib 的主上下文是"隐式全局状态"，最容易出错的地方。**
+`g_main_context_default()` 与 `g_main_loop_new(NULL, ...)`（thread-default）
+**是两个不同的上下文**，名字看着像但其实无关。
+
+涉及 glib 主循环的库（libnice、GStreamer 等）都要注意：
+**创建对象时用的上下文，必须与迭代事件用的上下文是同一个**。
+
+定位这类问题的有效手段（按成本从低到高）：
+1. 库的内部日志（`G_MESSAGES_DEBUG=all`）—— 看到"现象层"线索
+2. **tcpdump 抓包** —— 区分"没发出"和"发出了没收到"
+3. 最小复现 —— 排除自身代码复杂度
+
+第 (3) 步的 tcpdump 在这里是关键：它把问题从"STUN 不通"精确定位到
+"响应到达但未被处理"，从而把排查范围从网络层缩小到事件循环层。
+
+---
+
+## 坑 24：libnice 的 stun-server 只接受 IP，且必须强制 IPv4
+
+### 现象
+
+配置 `stun.l.google.com` 后仍然没有 srflx 候选。
+
+### 根因（两个叠加）
+
+**(a) libnice 0.1.16 的 stun-server 属性只接受 IP 地址**
+
+从动态库的字符串里能看到属性文档原文：
+```bash
+$ strings libnice.so.10 | grep -i "STUN server"
+"The IP address (not the hostname) of the STUN server to use"
+```
+
+传域名会被**静默忽略**——不报错、不警告、不收集 srflx。
+
+**(b) getaddrinfo 默认可能优先返回 IPv6**
+
+```bash
+$ getent hosts stun.l.google.com
+2001:4860:4864:5:8000::1          # ← 返回的是 IPv6！
+```
+
+WSL 的 IPv6 出网不通，于是 STUN 请求发往 IPv6 地址后一直重传超时。
+
+### 修复
+
+自己做一次**强制 IPv4** 的解析：
+
+```cpp
+std::string resolve_ipv4(const std::string& host) {
+    struct in_addr tmp;
+    if (inet_pton(AF_INET, host.c_str(), &tmp) == 1) return host;  // 已是 IP
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;          // ★ 只要 IPv4
+    hints.ai_socktype = SOCK_DGRAM;
+
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return "";
+
+    char buf[INET_ADDRSTRLEN] = {0};
+    auto* sa = reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
+    const char* ok = inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf));
+    freeaddrinfo(res);
+    return ok ? std::string(buf) : std::string();
+}
+```
+
+### 验证
+
+```
+[INFO][ice] STUN configured: stun.l.google.com (74.125.250.129):19302
+A 候选类型: host×6 srflx×3 relay×0     ← 公网映射候选收集成功
+```
+
+### 教训
+
+**"配置项传进去了"不等于"配置生效了"。**
+这里的属性是"静默忽略非法值"的语义——最难发现的一类问题。
+
+排查思路：**去动态库的字符串里找属性的真实文档**：
+```bash
+strings libnice.so.10 | grep -i "<属性名>"
+```
+这比查在线文档更可靠，因为**版本的差异就在二进制里**。
+
+另外：**跨平台网络代码要显式指定地址族**，不要依赖 getaddrinfo 的默认顺序。
+
+---
+
+## 汇总：这 24 个坑的类型分布
 
 | 类型 | 坑号 | 数量 |
 |---|---|---|
 | **逻辑/算法设计错误** | 1、10、11 | 3 |
 | **可测试性设计缺陷** | 9 | 1 |
 | **消息/并发时序问题** | 19、20 | 2 |
-| **C 库与 C++ 混用陷阱** | 15、16、17、18 | 4 |
+| **C 库与 C++ 混用陷阱** | 15、16、17、18、21 | 5 |
+| **事件循环 / 上下文管理** | **23** | 1 |
+| **库版本与配置语义** | 22、24 | 2 |
 | **测试方法错误** | 2 | 1 |
 | **语言细节** | 3、7、8 | 3 |
 | **环境/配置** | 4、5、6 | 3 |
@@ -905,13 +1141,29 @@ case LWS_CALLBACK_SERVER_WRITEABLE: {
 
 ### 最值得在面试中讲的
 
-1. **坑 1（乱序 vs 迟到）** —— "两个语义共用一个变量"的设计问题
-2. **坑 10（目标延迟跟平均值）** —— 修复后接受率 43% → 99.8%
-3. **坑 11（丢包统计口径）** —— 修复后与真值精确吻合
-4. **坑 17（裸内存里放 std::string）** —— C/C++ 混用的经典崩溃，靠 gdb 才定位
-5. **坑 20（覆盖式赋值丢消息）** —— 只在时序紧时出现的 bug，用队列根治
+| 坑 | 为什么值得讲 |
+|---|---|
+| **坑 1** 乱序 vs 迟到 | 两个语义共用一个变量 → 设计问题 |
+| **坑 10** 目标延迟跟平均值 | 修复后接受率 43% → 99.8% |
+| **坑 11** 丢包统计口径 | 修复后与真值精确吻合 |
+| **坑 17** 裸内存里放 std::string | C/C++ 混用经典崩溃，靠 gdb 定位 |
+| **坑 20** 覆盖式赋值丢消息 | 只在时序紧时出现的 bug，用队列根治 |
+| **坑 23** 上下文不一致收不到 STUN ⭐ | **tcpdump 抓包定位的完整案例**：请求发出、响应回来、却收不到 → 精确缩小到事件循环层 |
+| **坑 24** stun-server 只接受 IP | "配置传了但静默忽略" + 从二进制字符串找版本差异 |
 
-其中 1、10、11 是**算法级**的，17、20 是**架构级**的。
-四类问题的共同点：**都不是"报错改错"，而是需要理解系统语义才能定位**。
+**坑 23 和 24 是本项目定位难度最高的两个**——
+它们都不是"代码写错了"，而是"用法与环境不匹配"，
+且症状（拿不到候选）与根因（上下文/地址族）距离很远。
+
+**坑 23 的排查路径值得完整记住**：
+```
+候选收集失败
+  → 裸 socket 验证网络可达（排除网络问题）
+  → 库内部日志看到"重传"（锁定到 STUN 交互层）
+  → tcpdump 看到"请求发出 + 响应回来"（精确到"收到但没处理"）
+  → 检查事件循环上下文（找到根因）
+  → 改为共用显式上下文（修复）
+```
+
 
 

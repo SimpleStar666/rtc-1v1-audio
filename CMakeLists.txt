@@ -63,8 +63,16 @@ target_include_directories(rtc_signal PUBLIC src)
 target_link_libraries(rtc_signal PUBLIC rtc_common rtc_protocol ${LWS_LIBRARIES})
 target_include_directories(rtc_signal PRIVATE ${LWS_INCLUDE_DIRS})
 
+# ---------- ICE 传输模块 ----------
+add_library(rtc_ice STATIC
+  src/ice/ice_transport.cpp
+)
+target_include_directories(rtc_ice PUBLIC src)
+target_link_libraries(rtc_ice PUBLIC rtc_common ${NICE_LIBRARIES} ${GLIB_LIBRARIES})
+target_include_directories(rtc_ice PRIVATE ${NICE_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS})
+
 # ---------- 可执行目标（按阶段逐个加入）----------
-set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol rtc_signal pthread)
+set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol rtc_signal rtc_ice pthread)
 
 add_executable(selftest tests/selftest.cpp)
 target_link_libraries(selftest PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES} ${SRTP2_LIBRARIES})
@@ -83,3 +91,7 @@ target_include_directories(peer PRIVATE
 
 add_executable(weaknet_test tests/weaknet_test.cpp)
 target_link_libraries(weaknet_test PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES})
+
+add_executable(ice_test tests/ice_test.cpp)
+target_link_libraries(ice_test PRIVATE ${RTC_EXE_LINK} ${NICE_LIBRARIES} ${GLIB_LIBRARIES})
+target_include_directories(ice_test PRIVATE ${NICE_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS})
