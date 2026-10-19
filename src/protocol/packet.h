@@ -1,23 +1,32 @@
 #pragma once
-// 应用层包格式 —— 对应 WebRTC 的 RTP 载荷格式设计
+// 包格式 —— 对应 WebRTC 的 RTP 载荷格式设计
 //
-// 设计目标：把"会话语义"和"传输语义"编码进一个固定包头。
-// 对比 RTP 字段（本项目的映射）：
-//   RTP SSRC        -> session_id（哪路会话）
-//   RTP Sequence    -> seq（丢包检测 / 重排序，16bit 可回绕）
-//   RTP Timestamp   -> timestamp（播放时钟，用于抖动计算）
-//   RTP PT          -> phase（载荷语义：语音/控制）
-//   RTP 扩展头       -> flags + trans_id（会话标识，用于打断过滤）
+// ★ 重要设计约束：本包头与 **RTP 固定头前 12 字节兼容**。
 //
-// 包头（16 字节，网络字节序）：
-//   [0..1]   session_id   会话标识
-//   [2..3]   seq          序列号
-//   [4..7]   timestamp    采样时钟（每帧 + samples_per_frame）
-//   [8]      phase        阶段（见 Phase 枚举）
-//   [9]      flags        标志位（见 Flag 枚举）
-//   [10..11] trans_id     事务 ID（用于打断后过滤在途数据）
-//   [12..13] payload_len  载荷长度
-//   [14..15] header_crc   包头校验（CRC16 简化版）
+// 为什么必须兼容 RTP 头布局：
+//   SRTP（libsrtp2）会按标准 RTP 头解析包的字段（版本位、序号、时间戳、SSRC）。
+//   如果自定义包的首字节不是 0x80（RTP 版本=2），srtp_protect/unprotect 会
+//   拒绝处理，或者解析出错。实测表现：媒体包到达了（153 字节），
+//   但"首字节=0x00"导致 RTP 判断失败，直接走了 DTLS 分支。
+//   见 docs/02-pitfalls.md 坑 30。
+//
+// 因此头部布局与 RTP 对齐（前 12 字节），自定义字段放在 RTP 头之后：
+//
+//   --- RTP 兼容段（12 字节）---
+//   [0]      V/P/X/CC   版本位（=0x80）+ 无填充无扩展 + CSRC 计数 0
+//   [1]      M/PT       标志位（M）+ 载荷类型（PT，本项目用 96 动态类型）
+//   [2..3]   seq        序列号（网络字节序）
+//   [4..7]   timestamp  时间戳（网络字节序）
+//   [8..11]  ssrc       session_id 映射到的同步源标识（网络字节序）
+//   --- 自定义扩展段（8 字节）---
+//   [12]     phase      包阶段
+//   [13]     flags      标志位
+//   [14..15] trans_id   事务 ID（用于打断后过滤在途数据）
+//   [16..17] payload_len 载荷长度
+//   [18..19] ext_crc    扩展段校验
+//
+// 总头长 20 字节。这样既满足 SRTP 的 RTP 解析要求，
+// 又保留会话语义（trans_id / phase）。
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -47,16 +56,21 @@ enum Flag : uint8_t {
 
 const char* phase_name(Phase p);
 
+// 常量：RTP 头布局
+constexpr uint8_t kRtpVersionByte  = 0x80;   // V=2, P=0, X=0, CC=0
+constexpr uint8_t kRtpPayloadType  = 96;     // 动态载荷类型（Opus 常用 96~127）
+
 struct PacketHeader {
-    uint16_t session_id = 0;
-    uint16_t seq = 0;
-    uint32_t timestamp = 0;
+    uint16_t session_id = 0;      // 映射到 RTP SSRC
+    uint16_t seq = 0;             // RTP 序列号
+    uint32_t timestamp = 0;       // RTP 时间戳
     Phase    phase = Phase::kBody;
     uint8_t  flags = kFlagNone;
     uint16_t trans_id = 0;
     uint16_t payload_len = 0;
+    bool     marker = false;      // RTP M 位（标记重要边界，本项目用于 DING/END）
 
-    static constexpr size_t kSize = 16;
+    static constexpr size_t kSize = 20;   // 12（RTP 兼容）+ 8（自定义扩展）
 };
 
 class Packet {
@@ -71,8 +85,9 @@ public:
     static bool parse(const uint8_t* buf, size_t len,
                       PacketHeader* h, std::vector<uint8_t>* payload);
 
-    // 计算包头 CRC（简化：对前 14 字节做累加取反）
-    static uint16_t header_crc(const PacketHeader& h);
+    // 扩展段校验（8 字节自定义头的 CRC）
+    static uint16_t ext_crc(const PacketHeader& h);
+    static uint16_t header_crc(const PacketHeader& h);   // 兼容别名
 };
 
 }  // namespace rtc

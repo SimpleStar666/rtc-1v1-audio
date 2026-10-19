@@ -79,8 +79,15 @@ target_include_directories(rtc_crypto PUBLIC src)
 target_link_libraries(rtc_crypto PUBLIC rtc_common ${SRTP2_LIBRARIES} ${OPENSSL_LIBRARIES})
 target_include_directories(rtc_crypto PRIVATE ${SRTP2_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
 
+# ---------- 网络抗损模块（NACK / FEC / 拥塞控制）----------
+add_library(rtc_net STATIC
+  src/net/loss_protection.cpp
+)
+target_include_directories(rtc_net PUBLIC src)
+target_link_libraries(rtc_net PUBLIC rtc_common)
+
 # ---------- 可执行目标（按阶段逐个加入）----------
-set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol rtc_signal rtc_ice rtc_crypto pthread)
+set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol rtc_signal rtc_ice rtc_crypto rtc_net pthread)
 
 add_executable(selftest tests/selftest.cpp)
 target_link_libraries(selftest PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES} ${SRTP2_LIBRARIES})
@@ -107,3 +114,15 @@ target_include_directories(ice_test PRIVATE ${NICE_INCLUDE_DIRS} ${GLIB_INCLUDE_
 add_executable(dtls_srtp_test tests/dtls_srtp_test.cpp)
 target_link_libraries(dtls_srtp_test PRIVATE ${RTC_EXE_LINK} ${SRTP2_LIBRARIES} ${OPENSSL_LIBRARIES})
 target_include_directories(dtls_srtp_test PRIVATE ${SRTP2_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+
+add_executable(loss_protection_test tests/loss_protection_test.cpp)
+target_link_libraries(loss_protection_test PRIVATE ${RTC_EXE_LINK})
+
+# 端到端集成测试：音频经 ICE + DTLS-SRTP 完整链路
+add_executable(e2e_test tests/e2e_test.cpp)
+target_link_libraries(e2e_test PRIVATE ${RTC_EXE_LINK}
+  ${OPUS_LIBRARIES} ${SRTP2_LIBRARIES} ${NICE_LIBRARIES}
+  ${GLIB_LIBRARIES} ${OPENSSL_LIBRARIES})
+target_include_directories(e2e_test PRIVATE
+  ${OPUS_INCLUDE_DIRS} ${SRTP2_INCLUDE_DIRS} ${NICE_INCLUDE_DIRS}
+  ${GLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
