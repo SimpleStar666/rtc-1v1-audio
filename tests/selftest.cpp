@@ -18,14 +18,16 @@
 using namespace rtc;
 
 static int g_fail = 0;
-#define CHECK(cond, msg)                                              \
-    do {                                                              \
-        if (cond) {                                                   \
-            printf("  [PASS] %s\n", msg);                             \
-        } else {                                                      \
-            printf("  [FAIL] %s\n", msg);                             \
-            g_fail++;                                                 \
-        }                                                             \
+// 条件只求值一次（避免带副作用的表达式被执行两遍）。见 docs/02-pitfalls.md 坑 27。
+#define CHECK(cond, msg)                                                   \
+    do {                                                                   \
+        const bool _ok = (cond);                                           \
+        if (_ok) {                                                         \
+            printf("  [PASS] %s\n", msg);                                  \
+        } else {                                                           \
+            printf("  [FAIL] %s\n", msg);                                  \
+            g_fail++;                                                      \
+        }                                                                  \
     } while (0)
 
 // ---- 测试 1：Opus 编解码往返，验证音质 ----

@@ -71,8 +71,16 @@ target_include_directories(rtc_ice PUBLIC src)
 target_link_libraries(rtc_ice PUBLIC rtc_common ${NICE_LIBRARIES} ${GLIB_LIBRARIES})
 target_include_directories(rtc_ice PRIVATE ${NICE_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS})
 
+# ---------- 加密模块（DTLS-SRTP）----------
+add_library(rtc_crypto STATIC
+  src/crypto/dtls_srtp.cpp
+)
+target_include_directories(rtc_crypto PUBLIC src)
+target_link_libraries(rtc_crypto PUBLIC rtc_common ${SRTP2_LIBRARIES} ${OPENSSL_LIBRARIES})
+target_include_directories(rtc_crypto PRIVATE ${SRTP2_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+
 # ---------- 可执行目标（按阶段逐个加入）----------
-set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol rtc_signal rtc_ice pthread)
+set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol rtc_signal rtc_ice rtc_crypto pthread)
 
 add_executable(selftest tests/selftest.cpp)
 target_link_libraries(selftest PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES} ${SRTP2_LIBRARIES})
@@ -95,3 +103,7 @@ target_link_libraries(weaknet_test PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES})
 add_executable(ice_test tests/ice_test.cpp)
 target_link_libraries(ice_test PRIVATE ${RTC_EXE_LINK} ${NICE_LIBRARIES} ${GLIB_LIBRARIES})
 target_include_directories(ice_test PRIVATE ${NICE_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS})
+
+add_executable(dtls_srtp_test tests/dtls_srtp_test.cpp)
+target_link_libraries(dtls_srtp_test PRIVATE ${RTC_EXE_LINK} ${SRTP2_LIBRARIES} ${OPENSSL_LIBRARIES})
+target_include_directories(dtls_srtp_test PRIVATE ${SRTP2_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})

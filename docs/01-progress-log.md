@@ -425,9 +425,162 @@ $ strings libnice.so.10 | grep -i "STUN server"
 
 ---
 
-## 下一步（Phase 4+）
+## Phase 4：DTLS-SRTP 媒体加密
 
-- [ ] Phase 4：DTLS-SRTP 加密（libsrtp2 + OpenSSL）—— 把 ICE 通道上的明文换成加密媒体
-- [ ] Phase 5：弱网对抗（NACK / FEC / 拥塞控制）
-- [ ] Phase 6：端到端联调（音频经 ICE 通道传输）+ 指标上报
+### 做了什么
+
+1. 实现 `DtlsSrtpSession`：DTLS 1.2 握手 + RFC 5764 密钥派生 + SRTP 加解密
+2. 实现 `dtls_srtp_test`：进程内两个端点完成真实 DTLS 握手并互发加密 RTP
+3. 定位并修复了三个隐蔽问题（库 API 细节 / 协议默认行为 / 测试宏缺陷）
+
+### 实测结果（21 项全部通过）
+
+```
+=== 1. DTLS 握手（双方并发）===
+  [PASS] A 侧 DTLS 握手成功
+  [PASS] B 侧 DTLS 握手成功
+  [PASS] 双方 SRTP 会话就绪
+  [PASS] 双方都产出了证书指纹
+    协商出的加密套件: ECDHE-RSA-AES256-GCM-SHA384
+
+=== 2. 证书指纹一致性（防 MITM 的基础）===
+  [PASS] A 看到的对端指纹 == B 的本地指纹
+  [PASS] B 看到的对端指纹 == A 的本地指纹
+
+=== 3. RFC 5764 密钥派生 ===
+  [PASS] 双方导出的 client_key 一致       （16 字节）
+  [PASS] 双方导出的 server_key 一致
+  [PASS] 双方导出的 client_salt 一致      （14 字节）
+  [PASS] 双方导出的 server_salt 一致
+
+=== 4. SRTP 加密 / 解密往返 ===
+  [PASS] A 加密成功
+    明文 35 字节 -> 加密后 45 字节（+10 字节 HMAC-SHA1 认证标签）
+  [PASS] 密文与明文不同（确实加密了）
+  [PASS] B 解密成功 / 长度还原 / 内容与明文完全一致
+
+=== 5. 防篡改 ===
+  [PASS] 篡改后的密文被解密端拒绝（HMAC-SHA1 认证生效）
+
+=== 6. 明文包被拒绝 ===
+  [PASS] 未加密的明文包被 SRTP 拒绝
+
+################ 结果：全部通过（失败 0 项）################
+```
+
+### 关键数据
+
+| 项 | 值 |
+|---|---|
+| DTLS 版本 | 1.2 |
+| 协商套件 | ECDHE-RSA-AES256-GCM-SHA384 |
+| 证书 | RSA 2048 自签名（WebRTC 不允许 CA 证书） |
+| 指纹算法 | SHA-256（与 SDP `a=fingerprint` 格式一致） |
+| SRTP profile | SRTP_AES128_CM_SHA1_80 |
+| 密钥材料 | 60 字节 = client_key(16) + server_key(16) + client_salt(14) + server_salt(14) |
+| 认证标签开销 | 10 字节/包 |
+
+### 本阶段踩的坑（3 个，累计 27 个）
+
+| # | 坑 | 定位方式 |
+|---|---|---|
+| **25** | libsrtp2 API 三处不符预期 | 编译错误 + 查系统头文件 |
+| **26** | **DTLS 默认不请求对端证书** | 握手成功但 server 读不到证书 |
+| **27** | **测试宏二次求值** | "21 全 PASS 却报失败 2 项" |
+
+### 坑 25：libsrtp2 的三处 API 陷阱
+
+```
+(a) srtp_t 本身就是指针类型 —— 成员不能写 srtp_t*，srtp_create 才要 srtp_t*
+(b) 没有 keysalt 字段 —— key 与 salt 必须"连续存放"，由一个指针指向
+(c) std::vector<uint8_t> out(size_t(n)); 被解析成函数声明（most vexing parse）
+```
+
+**(c) 最隐蔽**：报错是 "request for member 'data' in 'rtc::out',
+which is of non-class type 'std::vector<unsigned char>(size_t)'"——
+看起来像类型写错，实际是**解析歧义**。修复：`static_cast<size_t>(n)`。
+
+### 坑 26：DTLS 双向证书交换（"握手成功 ≠ 双向已验证"）
+
+**现象**：
+```
+A.peer_fingerprint() = E6:84:0C:D1:...   ← client 读到了
+B.peer_fingerprint() = (空)              ← server 读不到
+```
+
+**根因**：**OpenSSL 的 DTLS server 默认不向 client 索要证书**
+（不发送 CertificateRequest）。所以：
+- client 必然收到 server 的证书 → A 能读到 ✓
+- server 不请求 client 证书 → client 不出示 → B 读不到 ✗
+
+**这是默认策略，不是缺陷。**
+
+**修复过程中的两次尝试**：
+
+| 尝试 | 结果 |
+|---|---|
+| `SSL_VERIFY_PEER \| SSL_VERIFY_FAIL_IF_NO_PEER_CERT` | ❌ 握手直接失败（自签名证书过不了 CA 校验）|
+| `SSL_VERIFY_PEER` + **始终放行的 verify_callback** | ✅ 双向证书交换成功 |
+
+```cpp
+SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER,
+    [](int, X509_STORE_CTX*) -> int { return 1; });   // 跳过 CA 链校验
+// 真正的身份保证来自握手后的"指纹比对"——这正是 WebRTC 的做法
+```
+
+**验证**：修复后双方指纹互验均通过。
+
+### 坑 27：测试宏二次求值（最隐蔽）
+
+**现象**（自相矛盾）：
+```
+21 项全部显示 [PASS]
+FAIL 行数：0
+汇总：存在失败（失败 2 项）        ← 数字对不上
+```
+
+**根因**：测试宏对条件求值了两次：
+```cpp
+#define CHECK(c, m) do {                              \
+    printf("  [%s] %s\n", (c) ? "PASS" : "FAIL", m);  /* ← 第一次 */ \
+    if (!(c)) g_fail++;                               /* ← 第二次 */ \
+} while (0)
+```
+对 `CHECK(a.protect(rtp, &len), "加密成功")` 这类**带副作用**的表达式：
+1. 第一次执行 `protect` → 成功 → 打印 **PASS**
+2. 第二次执行 `protect` → 包已加密、再加密失败 → **g_fail++**
+
+本项目正好有 2 处这样的调用，对应报出的"失败 2 项"。
+
+**修复**：条件只求值一次：
+```cpp
+#define CHECK(c, m) do {                                    \
+    const bool _ok = (c);                                   \
+    printf("  [%s] %s\n", _ok ? "PASS" : "FAIL", m);        \
+    if (!_ok) g_fail++;                                     \
+} while (0)
+```
+
+**验证**：`全部通过（失败 0 项）`
+
+**这个坑最危险的地方**：它不崩溃、不报编译错，只让"输出自相矛盾"。
+若不加核对 PASS 数量就去改**被测代码**，排查方向完全错了。
+
+### 与 WebRTC 的对应
+
+| 本项目 | WebRTC | 说明 |
+|---|---|---|
+| `DtlsSrtpSession::handshake` | DTLS 握手（ICE 选通后自动触发） | 密钥协商 |
+| `local_fingerprint()` | SDP `a=fingerprint:sha-256 ...` | 指纹交换 |
+| `peer_fingerprint()` 校验 | 证书指纹比对（抗 MITM） | 身份验证 |
+| `SSL_verify_callback 放行` | WebRTC 不允许 CA 证书 | 自签名策略 |
+| `SSL_export_keying_material` | libwebrtc 内部同样调用该 API | RFC 5764 密钥导出 |
+| `srtp_protect / unprotect` | 收发 RTP 时的加解密 | 媒体加密 |
+
+---
+
+## 下一步（Phase 5+）
+
+- [ ] Phase 5：弱网对抗（NACK 重传 / FEC 冗余 / 拥塞控制）
+- [ ] Phase 6：端到端联调（音频经 ICE + DTLS-SRTP 通道传输）+ 指标上报
 

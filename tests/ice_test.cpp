@@ -21,7 +21,13 @@
 using namespace rtc;
 
 static int g_fail = 0;
-#define CHECK(c, m) do { printf("  [%s] %s\n", (c) ? "PASS" : "FAIL", m); if (!(c)) g_fail++; } while (0)
+// 条件只求值一次（避免带副作用的表达式被执行两遍）。见 docs/02-pitfalls.md 坑 27。
+#define CHECK(c, m)                                                        \
+    do {                                                                   \
+        const bool _ok = (c);                                              \
+        printf("  [%s] %s\n", _ok ? "PASS" : "FAIL", m);                    \
+        if (!_ok) g_fail++;                                                \
+    } while (0)
 
 int main(int argc, char** argv) {
     const char* stun = nullptr;

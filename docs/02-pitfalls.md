@@ -1,6 +1,6 @@
 # 踩坑记录
 
-> 真实遇到的报错、误判和修复过程，共 24 个坑。
+> 真实遇到的报错、误判和修复过程，共 27 个坑。
 > 这些是最有价值的部分——面试时"你踩过什么坑"考的就是这些。
 
 **速览**：
@@ -31,10 +31,15 @@
 | 22 | libnice 版本 API 差异 | 库版本 | 编译失败 |
 | 23 | **agent 与主循环上下文不一致** ⭐ | **事件循环** | **收不到 STUN 响应** |
 | 24 | **stun-server 只接受 IP / IPv6 优先** | 库配置语义 | 静默忽略配置 |
+| 25 | **libsrtp2 API 三处不符预期** | C/C++ 混用 | 编译失败（含 most vexing parse）|
+| 26 | **DTLS 默认不请求对端证书** ⭐ | **协议默认行为** | server 读不到对端证书 |
+| 27 | **测试宏二次求值** ⭐ | **测试代码缺陷** | **全 PASS 却报失败** |
 
-**Phase 1 最值得讲：坑 9、10、11**（算法与可测试性）
-**Phase 2 最值得讲：坑 16、17、18、20**（C 库与 C++ 混用）
-**Phase 3 最值得讲：坑 23、24**（事件循环 + 配置语义，定位难度最高）
+**各阶段最值得讲**：
+- Phase 1：坑 **9、10、11**（算法与可测试性）
+- Phase 2：坑 **16、17、18、20**（C 库与 C++ 混用）
+- Phase 3：坑 **23、24**（事件循环 + 配置语义，定位难度最高）
+- Phase 4：坑 **25、26、27**（库 API 细节 + 协议默认行为 + 测试自身缺陷）
 
 ---
 
@@ -1124,17 +1129,250 @@ strings libnice.so.10 | grep -i "<属性名>"
 
 ---
 
-## 汇总：这 24 个坑的类型分布
+## 坑 25：libsrtp2 的 API 与"想当然"不符（三处）
+
+### 现象
+
+一连串编译错误：
+
+```
+error: conflicting declaration 'typedef srtp_ctx_t* srtp_t'
+error: 'srtp_policy_t' has no member named 'keysalt'; did you mean 'keys'?
+error: request for member 'data' in 'rtc::out', which is of non-class type 'std::vector<unsigned char>(size_t)'
+error: cannot convert 'srtp_t**' to 'srtp_t'
+```
+
+### 根因（三个独立问题）
+
+**(a) `srtp_t` 本身就是指针类型**
+
+```c
+typedef struct srtp_ctx_t_ srtp_ctx_t;
+typedef srtp_ctx_t *srtp_t;        // ← srtp_t 已经是指针
+```
+
+所以成员应声明为 `srtp_t srtp_in_;`，**不是** `srtp_t* srtp_in_;`。
+而 `srtp_create(&session, &policy)` 的第一个参数是 `srtp_t*`（二级指针）——
+因为它要"输出"一个 `srtp_t`。
+
+**(b) 没有 `keysalt` 字段；`key` 必须"key+salt 连续"**
+
+```c
+typedef struct srtp_policy_t {
+    unsigned char *key;        // ← 只要一个指针
+    srtp_master_key_t **keys;
+    unsigned long num_master_keys;
+    ...
+} srtp_policy_t;
+```
+
+libsrtp 按套件定义的长度（AES-128：key 16B + salt 14B）**从 `key` 指针连续读取**。
+所以必须自己把 key 和 salt 拼成一段连续内存：
+
+```cpp
+std::vector<uint8_t> material;
+material.insert(material.end(), key, key + 16);
+material.insert(material.end(), salt, salt + 14);
+policy.key = material.data();
+```
+
+**(c) Most vexing parse（最令人烦恼的解析）**
+
+```cpp
+std::vector<uint8_t> out(size_t(pending));   // ← 被解析成**函数声明**！
+int n = BIO_read(wbio_, out.data(), pending);
+// error: request for member 'data' in 'rtc::out',
+//        which is of non-class type 'std::vector<unsigned char>(size_t)'
+```
+
+`std::vector<uint8_t> out(size_t(pending));` 中 `size_t(pending)` 看起来像参数声明，
+于是整行被当作"声明一个名为 out 的函数，接受一个 size_t 参数"。
+**报错信息完全看不出这是个解析歧义。**
+
+修复：显式转换，或改用花括号/等号初始化：
+
+```cpp
+std::vector<uint8_t> out(static_cast<size_t>(pending));   // ✓
+```
+
+### 教训
+
+1. **对着系统头文件写代码**，不要凭记忆或最新文档：
+   ```bash
+   grep -n -A20 'typedef struct srtp_policy_t' /usr/include/srtp2/srtp.h
+   ```
+2. **看到 "request for member X in Y, which is of non-class type" 时，
+   第一反应应该是 most vexing parse**，而不是怀疑类型写错。
+3. 涉及"多段密钥材料"的 API，先确认它是"分开传"还是"连续传"。
+
+---
+
+## 坑 26：DTLS 双向证书交换 —— server 侧读不到对端证书
+
+### 现象
+
+DTLS 握手两侧都返回成功，但：
+
+```
+A.peer_fingerprint() = E6:84:0C:D1:...    ← client 能读到对端证书
+B.peer_fingerprint() = (空)               ← server 读不到
+```
+
+且 `SSL_get_peer_certificate()` 在 server 侧返回 NULL。
+
+### 定位过程
+
+**(1) 先怀疑"握手完成时机不对称"** —— 尝试在 server 侧多跑几轮
+"收包 + 推进状态机"，无效。说明不是时序问题。
+
+**(2) 查 OpenSSL 的默认行为** —— 关键认知：
+
+> **OpenSSL 的 DTLS server 默认不向 client 索要证书**
+> （不发送 CertificateRequest）。
+
+所以：
+- client **总是**会收到 server 的证书（server 必然出示）→ A 能读到 ✓
+- server **不会**请求 client 的证书 → client 不出示 → B 读不到 ✗
+
+**这不是库的缺陷，而是默认策略。** 要双向互验证书必须显式开启。
+
+**(3) 尝试一：`SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT`** —— 失败。
+
+握手直接不通过。因为 WebRTC 场景用的是**自签名证书**，
+标准校验必然报 "unable to get local issuer certificate"，
+`FAIL_IF_NO_PEER_CERT` 就把整个握手拒掉了。
+
+**(4) 尝试二（正确）：`SSL_VERIFY_PEER` + 始终放行的 verify_callback**
+
+```cpp
+SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER,
+    [](int /*preverify_ok*/, X509_STORE_CTX* /*ctx*/) -> int {
+        return 1;   // 跳过 CA 链校验；身份由业务层"指纹比对"保证
+    });
+```
+
+注意 `SSL_VERIFY_PEER` 的作用是**请求对端证书**，
+而 verify_callback 返回 1 保证自签名证书不被拒。
+**真正的身份验证由我们在握手后比对的指纹完成**——这正是 WebRTC 的做法
+（WebRTC 也不允许 CA 证书，只用 `a=fingerprint` 校验）。
+
+### 验证
+
+```
+修复前: A 读到指纹 ✓ / B 读到空 ✗
+修复后: A 读到指纹 ✓ / B 读到指纹 ✓   （双向指纹互验均通过）
+```
+
+### 教训
+
+**"握手成功"不等于"双向身份都已验证"。**
+DTLS/TLS 的默认策略是"服务端出示证书、客户端可选"——
+mTLS（双向）需要显式请求。
+
+排查这类问题的方法：**先确认协议默认行为，再怀疑实现**。
+本例中"client 正常、server 为空"这个不对称现象本身就是强线索：
+它精确指向"谁向谁索要证书"的默认策略差异。
+
+另外：**用自签名证书时，`SSL_VERIFY_FAIL_IF_NO_PEER_CERT` 会直接拒掉握手**——
+需要自定义 verify_callback 放行，把身份保证交给上层（指纹比对）。
+
+---
+
+## 坑 27：测试宏二次求值 —— "全 PASS 却报失败"（★ 隐蔽性极高）
+
+### 现象
+
+极其自相矛盾的输出：
+
+```
+21 项全部显示 [PASS]
+FAIL 行数：0
+但汇总行：################ 结果：存在失败（失败 2 项）################
+```
+
+**打印全是 PASS，计数器却非零。**
+
+### 根因
+
+测试宏对条件**求值了两次**：
+
+```cpp
+#define CHECK(c, m) do {                              \
+    printf("  [%s] %s\n", (c) ? "PASS" : "FAIL", m);  \
+    /*                    ↑ 第一次求值 */               \
+    if (!(c)) g_fail++;                               \
+    /*     ↑ 第二次求值 */                             \
+} while (0)
+```
+
+对**无副作用**的表达式（如 `a.peer_fingerprint() == b_fp`）没问题；
+但对**带副作用**的表达式就致命：
+
+```cpp
+CHECK(a.protect(rtp.data(), &len), "A 加密成功");
+//     ↑ 这个调用会被执行两次
+```
+
+执行过程：
+1. `printf` 里的第一次调用 `a.protect(...)` → 明文成功加密 → 打印 **PASS**
+2. `if` 里的第二次调用 `a.protect(...)` → 这个包**已经加密过了**，
+   再加密一次会失败（返回 false）→ `g_fail++`
+
+本项目中共有 2 处这样的表达式（`a.protect` 和 `b.unprotect`），
+恰好对应报出的"失败 2 项"。
+
+### 修复
+
+**条件只求值一次**，存入局部变量：
+
+```cpp
+#define CHECK(c, m)                                     \
+    do {                                                \
+        const bool _ok = (c);    /* 只求值一次 */        \
+        printf("  [%s] %s\n", _ok ? "PASS" : "FAIL", m); \
+        if (!_ok) g_fail++;                             \
+    } while (0)
+```
+
+### 验证
+
+```
+修复前: 21 PASS / 0 FAIL 行 / 汇总"失败 2 项"
+修复后: 21 PASS / 0 FAIL 行 / 汇总"全部通过（失败 0 项）"   ✅
+```
+
+### 教训
+
+**宏参数必须当作"可能被求值多次"来处理。**
+这是 C/C++ 宏的经典陷阱，但在测试代码里尤为危险——
+因为它会伪造出"测试失败"的假象，让你去排查**没有问题的被测代码**。
+
+防御手段：
+1. 宏体里**先求值到局部变量**，只用变量（本项目采用）
+2. 或者把带副作用的调用**先执行、把结果传给宏**：
+   ```cpp
+   const bool ok = a.protect(...);
+   CHECK(ok, "A 加密成功");
+   ```
+3. 用 `static inline` 模板函数替代宏（C++ 里最彻底的做法）
+
+**这个坑最有价值的地方是它的表现**：
+不是崩溃、不是编译错误，而是"输出自相矛盾"——
+如果不仔细核对 PASS 数量与汇总计数，很容易误判成被测代码有问题。
+
+---
+
+## 汇总：这 27 个坑的类型分布
 
 | 类型 | 坑号 | 数量 |
 |---|---|---|
 | **逻辑/算法设计错误** | 1、10、11 | 3 |
 | **可测试性设计缺陷** | 9 | 1 |
+| **测试代码自身缺陷** | 2、**27** | 2 |
 | **消息/并发时序问题** | 19、20 | 2 |
-| **C 库与 C++ 混用陷阱** | 15、16、17、18、21 | 5 |
+| **C 库与 C++ 混用陷阱** | 15、16、17、18、21、**25** | 6 |
 | **事件循环 / 上下文管理** | **23** | 1 |
-| **库版本与配置语义** | 22、24 | 2 |
-| **测试方法错误** | 2 | 1 |
+| **协议默认行为与配置语义** | 22、24、**26** | 3 |
 | **语言细节** | 3、7、8 | 3 |
 | **环境/配置** | 4、5、6 | 3 |
 | **其他实现疏漏** | 12、13、14 | 3 |
@@ -1143,27 +1381,42 @@ strings libnice.so.10 | grep -i "<属性名>"
 
 | 坑 | 为什么值得讲 |
 |---|---|
-| **坑 1** 乱序 vs 迟到 | 两个语义共用一个变量 → 设计问题 |
-| **坑 10** 目标延迟跟平均值 | 修复后接受率 43% → 99.8% |
-| **坑 11** 丢包统计口径 | 修复后与真值精确吻合 |
-| **坑 17** 裸内存里放 std::string | C/C++ 混用经典崩溃，靠 gdb 定位 |
-| **坑 20** 覆盖式赋值丢消息 | 只在时序紧时出现的 bug，用队列根治 |
-| **坑 23** 上下文不一致收不到 STUN ⭐ | **tcpdump 抓包定位的完整案例**：请求发出、响应回来、却收不到 → 精确缩小到事件循环层 |
-| **坑 24** stun-server 只接受 IP | "配置传了但静默忽略" + 从二进制字符串找版本差异 |
+| **1** 乱序 vs 迟到 | 两个语义共用一个变量 → 设计问题 |
+| **10** 目标延迟跟平均值 | 修复后接受率 43% → 99.8% |
+| **11** 丢包统计口径 | 修复后与真值精确吻合 |
+| **17** 裸内存里放 std::string | C/C++ 混用经典崩溃，靠 gdb 定位 |
+| **20** 覆盖式赋值丢消息 | 只在时序紧时出现，用队列根治 |
+| **23** 上下文不一致收不到 STUN ⭐ | **tcpdump 抓包定位的完整案例** |
+| **24** stun-server 只接受 IP | 从二进制字符串找版本差异 |
+| **26** DTLS 默认不请求对端证书 ⭐ | "握手成功 ≠ 双向身份已验证" |
+| **27** 宏二次求值 ⭐ | **"全 PASS 却报失败"——最难自己发现的一类测试缺陷** |
 
-**坑 23 和 24 是本项目定位难度最高的两个**——
-它们都不是"代码写错了"，而是"用法与环境不匹配"，
-且症状（拿不到候选）与根因（上下文/地址族）距离很远。
+### 定位方法论总结（本项目最有价值的部分）
 
-**坑 23 的排查路径值得完整记住**：
+七个疑难问题的排查路径，都遵循"分层缩小范围"：
+
 ```
-候选收集失败
-  → 裸 socket 验证网络可达（排除网络问题）
-  → 库内部日志看到"重传"（锁定到 STUN 交互层）
-  → tcpdump 看到"请求发出 + 响应回来"（精确到"收到但没处理"）
+候选收集失败（坑 23）
+  → 裸 socket 验证网络可达（排除网络层）
+  → 库内部日志看到"重传"（锁到 STUN 交互层）
+  → tcpdump 看到"请求发出+响应回来"（精确定位到"收到但没处理"）
   → 检查事件循环上下文（找到根因）
-  → 改为共用显式上下文（修复）
+
+server 读不到证书（坑 26）
+  → 先排除时序（多跑几轮无效）
+  → 查协议默认行为（server 不请求 client 证书）
+  → 试 FAIL_IF_NO_PEER_CERT（握手被拒）
+  → 改 permissive callback（解决）
+
+全 PASS 却报失败（坑 27）
+  → 核对 PASS 行数与计数（发现自相矛盾）
+  → 检查宏定义（发现条件被求值两次）
 ```
+
+**共同点：症状与根因的距离都很远。**
+真正解决问题的不是"改代码"，而是**先精确描述现象**——
+比如坑 27 若只看到"测试失败"就去改被测代码，方向完全错了。
+
 
 
 
