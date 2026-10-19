@@ -13,8 +13,8 @@
 | 抖动缓冲 / 播放调度 | 自研 | **NetEq** | ✅ 已实现并验证 |
 | 音频设备 | 自研虚拟设备 | **ADM** | ✅ 已实现并验证 |
 | 信令 | **libwebsockets** | WebSocket 信令（标准不规定） | ✅ 两端配对已跑通 |
-| NAT 穿透 | **libnice** | ICE / STUN (RFC 8445/5389) | ⬜ Phase 3 |
-| 媒体加密 | **OpenSSL DTLS** + **libsrtp2** | DTLS-SRTP (RFC 5764) | ⬜ Phase 4 |
+| NAT 穿透 | **libnice** | ICE / STUN (RFC 8445/5389) | ✅ 实测拿到 srflx 候选 |
+| 媒体加密 | **OpenSSL DTLS** + **libsrtp2** | DTLS-SRTP (RFC 5764) | ✅ 21 项验证通过 |
 | 抗丢包 | 自研 | NACK / ULPFEC | ✅ 抖动缓冲侧已实现 |
 | 拥塞控制 | 自研 | GCC | ⬜ Phase 5 |
 
@@ -93,22 +93,32 @@ cd rtc-1v1-audio
   8%  丢包 → 检测 38       15% → 检测 67 （实际 67）
   ±80ms 抖动 0 丢包 → 检测 0，接受率 99.8%
 
-端到端 loopback：84 包全部收发，0 编解码错误，0 PLC，码率 16.0kbps
+端到端 loopback：84 包全部收发，0 编解码错误，0 PLC
+
+ICE 穿透：
+  host 候选场景：各 6 个候选，候选对选通，双向收发确认内容来自对端
+  STUN 场景：host×6 srflx×3 relay×0（成功获取公网映射候选）
+
+DTLS-SRTP（21 项全部通过）：
+  协商套件 ECDHE-RSA-AES256-GCM-SHA384
+  双向证书指纹互验通过
+  RFC 5764 密钥四方一致（client/server key + salt）
+  SRTP 加密 35→45 字节（+10 字节认证标签），解密内容与明文一致
+  篡改密文被拒 / 未加密明文包被拒
 
 信令配对（两端 + 服务器）：
-  双向消息零丢失（joined / peer_ready / offer / answer / candidate）
-  服务器转发明细完整，无内存错误
+  joined / peer_ready / offer / answer / candidate 双向零丢失
 ```
 
 ## 进度
 
 - [x] **Phase 0**：环境侦察与依赖验证
 - [x] **Phase 1**：媒体层（Opus / 抖动缓冲 / 虚拟设备 / 包格式）
-- [x] **Phase 2**：WebSocket 信令（客户端 + 服务器，两端配对已跑通）
-- [ ] Phase 3：libnice ICE / STUN 穿透
-- [ ] Phase 4：DTLS-SRTP 加密
+- [x] **Phase 2**：WebSocket 信令（客户端 + 服务器，两端配对跑通）
+- [x] **Phase 3**：libnice ICE / STUN 穿透（实测拿到 srflx 候选）
+- [x] **Phase 4**：DTLS-SRTP 媒体加密（21 项验证通过）
 - [ ] Phase 5：弱网对抗（NACK / FEC / 拥塞控制）
-- [ ] Phase 6：端到端联调 + 指标统计
+- [ ] Phase 6：端到端联调（音频经 ICE+SRTP 通道）+ 指标统计
 
 ## 目录结构
 
@@ -118,8 +128,10 @@ src/
   media/     Opus 封装、抖动缓冲（NetEq）、虚拟设备（ADM）、音频管线
   protocol/  包格式（RTP 映射）、信令消息（JSON）
   signal/    WebSocket 信令服务器 + 客户端
+  ice/       ICE / STUN 穿透（libnice 封装）
+  crypto/    DTLS-SRTP 加密（OpenSSL + libsrtp2）
   app/       通话端点（--loopback / --peer-test 两种模式）
-docs/        架构 / 进度 / 踩坑（20 项）/ 验证
-tests/       自检与弱网测试
-scripts/     构建与诊断脚本
+docs/        架构 / 进度 / 踩坑（27 项）/ 验证
+tests/       自检、弱网、ICE、DTLS-SRTP 测试
+scripts/     构建、诊断与验证脚本
 ```
