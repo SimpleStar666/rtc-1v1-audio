@@ -51,13 +51,39 @@ CMake   : 4.4.4 (pip 安装，系统自带 3.16 不满足新版依赖)
 **已知环境限制**（如实记录，见 [docs/03-verification.md](docs/03-verification.md)）：
 - WSL 无 `/dev/snd` 声卡设备 → 用**虚拟音频设备**（文件/合成 PCM）替代真实麦克风与扬声器
 
+## 快速开始
+
+**只想看效果？一条命令：**
+
+```bash
+./scripts/run.sh
+```
+
+菜单里选 **"完整演示"**（编译 → 测试 → 自环听声音 → 双端通话）。
+
+或者直接用子命令：
+
+```bash
+./scripts/run.sh build      # 编译
+./scripts/run.sh test       # 全部测试
+./scripts/run.sh loopback   # 本地自环，会播放音频给你听
+./scripts/run.sh call       # 双端真实通话（自动起服务器 + A/B 配对）
+./scripts/run.sh weaknet    # 弱网矩阵（丢包 0/2/5/8/15% 对照）
+./scripts/run.sh help       # 全部命令说明
+```
+
+> **完整操作手册（怎么跑、怎么玩、怎么演示）见
+> [docs/04-how-to-run.md](docs/04-how-to-run.md)** —— 含环境准备、
+> 逐命令详解、各组件单独运行、听声音、面试演示脚本、常见问题、命令速查表。
+
 ## 文档导航
 
 | 文档 | 内容 |
 |---|---|
+| [**docs/04-how-to-run.md**](docs/04-how-to-run.md) | **操作手册：怎么跑、怎么玩、怎么演示** |
 | [docs/00-architecture.md](docs/00-architecture.md) | 整体架构、数据流、包格式与 RTP 的映射 |
-| [docs/01-progress-log.md](docs/01-progress-log.md) | **开发进度与重点记录**（每步做了什么、学到什么） |
-| [docs/02-pitfalls.md](docs/02-pitfalls.md) | **踩坑记录（20 项，含真实报错与解法）** |
+| [docs/01-progress-log.md](docs/01-progress-log.md) | 开发进度与重点记录（每步做了什么、学到什么） |
+| [docs/02-pitfalls.md](docs/02-pitfalls.md) | **踩坑记录（34 项，含真实报错与解法）** |
 | [docs/03-verification.md](docs/03-verification.md) | **验证数据与实测结果** |
 
 ## 构建
@@ -69,25 +95,40 @@ python3 -m pip install --user "cmake>=3.28"
 export PATH=$HOME/.local/bin:$PATH
 
 cd rtc-1v1-audio
-./scripts/build.sh
+./scripts/run.sh build
 ```
 
 ## 运行
 
 ```bash
-# 自检（6 组组件测试）
-./build/selftest
+# 一键演示（推荐）
+./scripts/run.sh demo
 
-# 弱网测试（可指定丢包/抖动/延迟）
+# 或单独运行各组件
+./build/selftest                                          # 媒体层 6 组自检
 ./build/weaknet_test --loss 8 --jitter 30 --delay 60 --seconds 10
+./build/peer --loopback --seconds 3                       # 本地自环
+./build/ice_test --seconds 3                              # ICE 穿透 + Trickle ICE
+./build/ice_test --stun stun.l.google.com --stun-port 19302 --seconds 2
+./build/dtls_srtp_test                                    # DTLS-SRTP（21 项）
+./build/loss_protection_test                              # NACK/FEC/拥塞控制
+./build/metrics_test                                      # 指标统计
+./build/e2e_test --seconds 4                              # 完整链路
+./build/e2e_test --loss 0.25 --seconds 4                  # 弱网下的完整链路
 
-# 本地媒体链路自环验证（不经网络）
-./build/peer --loopback --seconds 5
+# 信令配对（三个终端）
+./build/signal_server --port 8899
+./build/peer --signal ws://127.0.0.1:8899 --room demo --name A --peer-test
+./build/peer --signal ws://127.0.0.1:8899 --room demo --name B --peer-test
+```
 
-# 信令配对测试（需先启动服务器）
-./build/signal_server --port 8888 &
-./build/peer --signal ws://127.0.0.1:8888 --room demo --name A --peer-test --seconds 3 &
-./build/peer --signal ws://127.0.0.1:8888 --room demo --name B --peer-test --seconds 3
+### 听到声音
+
+```bash
+./scripts/run.sh loopback          # 自动播放解码后的音频
+# 或手工：
+python3 /tmp/rtc_demo/pcm2wav.py /tmp/peer_out.pcm /tmp/peer_out.wav 16000
+paplay /tmp/peer_out.wav
 ```
 
 ## 实测结果摘要

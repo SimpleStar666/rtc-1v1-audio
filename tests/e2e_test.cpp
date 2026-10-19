@@ -187,16 +187,23 @@ int main(int argc, char** argv) {
                 if (Packet::parse(buf.data(), size_t(blen), &ph, &pp)) {
                     recv_packets++;
                     metrics.on_packet_received(size_t(blen));
-                    nack.on_packet(ph.seq, -1);
+
                     if (ph.flags & kFlagFecPacket) {
+                        // ★ FEC 包用独立 SSRC（session_id=2），序号空间与媒体流不同。
+                        //   只能喂给 FEC 解码器，**绝不能**喂给 NACK 统计 ——
+                        //   否则两个序号空间混在一起，丢包统计会算错。
+                        //
+                        //   这个错误实际发生过（本文件早期版本把 nack.on_packet
+                        //   放在分支判断之前，所有包都进了 NACK）：
+                        //   25% 丢包时 "实际丢弃 9" 却只 "检测丢包 6" —— 少报，
+                        //   因为 NACK 看到的序号序列被 FEC 包搅乱了。
+                        //   见 docs/02-pitfalls.md 坑 34。
                         std::vector<std::pair<uint16_t, std::vector<uint8_t>>> rec;
                         fec_dec.on_fec(pp.data(), pp.size(), &rec);
                         metrics.on_recovered_fec(fec_dec.stats().recovered);
-                        // FEC 包用独立 SSRC（session_id=2），
-                        // 其序号空间与媒体流不同，**不能**喂给 NACK 统计，
-                        // 否则会把两个序号空间混在一起导致丢包统计虚高。
-                        // 见 docs/02-pitfalls.md 坑 30。
                     } else if (ph.session_id == 1) {
+                        // 媒体流：喂给 NACK 统计 + FEC 源包记录 + 抖动缓冲
+                        nack.on_packet(ph.seq, -1);
                         fec_dec.on_source(ph.seq, pp.data(), pp.size());
                         std::vector<std::vector<uint8_t>> frames;
                         if (OpusCodec::unpack_frames(pp.data(), int(pp.size()), &frames) >= 0) {
