@@ -30,7 +30,17 @@ struct CallMetrics {
     uint64_t fec_packets_sent = 0;     // 发出的 FEC 冗余包
     uint64_t nack_requests = 0;        // 发出的 NACK 请求
     uint64_t retransmitted_packets = 0;// 重传的包
-    uint64_t bytes_sent = 0;
+    // ★ 两个字节计数必须分开，不能混在一起累加。
+    //
+    // payload_bytes = 编码器输出的**载荷**字节（衡量编码效率）
+    // wire_bytes    = 实际发到网络上的**整包**字节（含 RTP/SRTP 头与 FEC 冗余）
+    //
+    // 早期实现把两者都累加到同一个 bytes_sent 上，导致
+    // "实测码率 82933 bps" 而目标码率只有 48000 —— 数值凭空翻倍。
+    // 这是"同一变量承载两种语义"的又一次复发（坑 1 / 11 / 32 同类）。
+    // 见 docs/02-pitfalls.md 坑 33。
+    uint64_t payload_bytes = 0;
+    uint64_t wire_bytes = 0;
 
     // ---- 接收侧 ----
     uint64_t packets_received = 0;
@@ -74,10 +84,12 @@ struct CallMetrics {
     int64_t  duration_ms = 0;
 
     // 派生指标（自动计算）
-    int      actual_bitrate_bps() const;
-    double   recovery_rate() const;      // 丢包恢复率 = 恢复数/总丢包数
-    uint64_t still_missing() const;      // 最终仍缺失的包数（= 总丢包 - 恢复）
-    double   playout_continuity() const; // 播放连续性
+    int      actual_bitrate_bps() const;   // 按 payload_bytes 计（编码码率）
+    int      wire_bitrate_bps() const;     // 按 wire_bytes 计（含头与冗余的开销）
+    double   overhead_ratio() const;       // 网络开销比 = wire / payload
+    double   recovery_rate() const;        // 丢包恢复率 = 恢复数/总丢包数
+    uint64_t still_missing() const;        // 最终仍缺失的包数（= 总丢包 - 恢复）
+    double   playout_continuity() const;   // 播放连续性
     double   encode_success_rate() const;
 
     std::string to_string() const;       // 人类可读

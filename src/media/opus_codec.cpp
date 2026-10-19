@@ -73,6 +73,26 @@ bool OpusCodec::init(int bitrate_bps, int complexity, bool use_vbr, bool use_inb
     return true;
 }
 
+// 运行时调整目标码率 —— 让拥塞控制真正生效（闭环的最后一环）。
+//
+// 注意 OPUS_SET_BITRATE 系列宏展开为两个参数（控制项 + 值），
+// 不能写成 OPUS_SET_BITRATE(x)。见 docs/02-pitfalls.md 坑 3。
+bool OpusCodec::set_bitrate(int bps) {
+    if (!enc_) return false;
+    // Opus 的合法码率范围：6~510 kbps（单声道 16kHz 下 6~64 已足够）
+    if (bps < 6000)   bps = 6000;
+    if (bps > 128000) bps = 128000;
+
+    const int rc = opus_encoder_ctl(enc_, OPUS_SET_BITRATE_REQUEST, opus_int32(bps));
+    if (rc != OPUS_OK) {
+        LOGE(kTag, "set_bitrate(%d) failed: %d", bps, rc);
+        return false;
+    }
+    bitrate_ = bps;
+    LOGD(kTag, "bitrate adapted to %d bps", bps);
+    return true;
+}
+
 int OpusCodec::encode(const int16_t* pcm, int samples, uint8_t* out, int out_cap) {
     if (!enc_) return -1;
     if (samples != kFrameSamples) {

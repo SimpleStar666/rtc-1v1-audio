@@ -157,12 +157,17 @@ int main(int argc, char** argv) {
     printf("\n=== 7. 完整指标报告（示例）===\n");
     printf("%s\n", s.to_string().c_str());
 
-    // 字节码率检验：22940 字节 / 5000ms = 36.7 kbps
+    // 码率检验：载荷码率与网络码率必须分开算
     const int br = s.actual_bitrate_bps();
-    printf("  派生码率: %d bps（%llu 字节 / %lld ms）\n",
-           br, (unsigned long long)s.bytes_sent, (long long)s.duration_ms);
-    CHECK(near(double(br), 22940.0 * 8 * 1000 / 5000.0, 1.0),
-          "实测码率按字节/时长正确计算");
+    const int wbr = s.wire_bitrate_bps();
+    printf("  载荷码率: %d bps（%llu 载荷字节 / %lld ms）\n",
+           br, (unsigned long long)s.payload_bytes, (long long)s.duration_ms);
+    printf("  网络码率: %d bps（%llu 网络字节，开销比 %.2f）\n",
+           wbr, (unsigned long long)s.wire_bytes, s.overhead_ratio());
+    CHECK(near(double(br), 248.0 * 40 * 8 * 1000 / 5000.0, 1.0),
+          "载荷码率按编码字节/时长正确计算");
+    CHECK(wbr > br, "网络码率 > 载荷码率（含头与 FEC 冗余开销）");
+    CHECK(s.overhead_ratio() > 1.0, "开销比 > 1（确实有额外开销）");
 
     printf("\n################ 结果：%s（失败 %d 项）################\n",
            g_fail == 0 ? "全部通过" : "存在失败", g_fail);

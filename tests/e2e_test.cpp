@@ -163,6 +163,15 @@ int main(int argc, char** argv) {
     FecDecoder fec_dec;
     MetricsCollector metrics;      // 统一指标采集（对应 WebRTC getStats）
 
+    // 拥塞控制（对应 GCC）：根据延迟梯度与丢包率自适应调码率。
+    // 输出接到编码器上，形成"测量 -> 决策 -> 生效"的闭环。
+    CongestionController::Config ccfg;
+    ccfg.start_bitrate_bps = 16000;
+    ccfg.min_bitrate_bps = 6000;
+    ccfg.max_bitrate_bps = 48000;
+    CongestionController gcc(ccfg);
+    std::atomic<int> last_adaptive_bps{16000};
+
     // 统一的接收处理：先看是不是 SRTP（RTP 版本位 = 2），
     // 不是则当作 DTLS 记录交给握手侧。
     auto on_ice_recv = [&](const uint8_t* data, size_t len) {
@@ -302,7 +311,29 @@ int main(int argc, char** argv) {
                                               wire, sizeof(wire));
                 if (total <= 0) continue;
 
-                // FEC：为每 4 个源包生成 1 个冗余包
+                // 拥塞控制闭环：把"包的到达情况"反馈给 GCC，由它调目标码率。
+                //
+                // 这里用简化但真实的反馈：以发送节拍作为 send_ms，
+                // 以当前时间作为 recv_ms（同机测试二者接近，梯度会反映排队趋势）。
+                // 真实部署中 recv_ms 来自接收端的 RTCP 反馈。
+                gcc.on_arrival(next, now_ms());
+                gcc.on_loss_rate(loss_rate);
+                const int target = gcc.update_bitrate(now_ms());
+                last_adaptive_bps = target;
+                // 把目标码率作用到编码器上（形成闭环）
+                codec_a.set_bitrate(target);
+
+                // 按丢包率动态调整 FEC 冗余率（工程上的关键权衡）：
+                //   <5%   丢包：靠 NACK 就够，冗余降到 k=8（12.5% 开销）
+                //   5~15% 丢包：k=4（25% 开销）
+                //   >15%  丢包：k=2（50% 开销，优先保连续性）
+                // 这是"带宽 vs 抗损"的动态取舍，对应 WebRTC 的
+                // protect_bitrate / FEC overhead 自适应。
+                if (loss_rate < 0.05)       fec_enc.set_group_size(8);
+                else if (loss_rate < 0.15)  fec_enc.set_group_size(4);
+                else                        fec_enc.set_group_size(2);
+
+                // FEC：按当前动态冗余率生成冗余包
                 std::vector<uint8_t> fec_payload;
                 bool has_fec = fec_enc.add_source(h.seq, payload.data(),
                                                   payload.size(), &fec_payload);
@@ -429,6 +460,14 @@ int main(int argc, char** argv) {
     printf("  SRTP 加密/解密    : %llu / %llu\n",
            (unsigned long long)sa.stats().protected_pkts,
            (unsigned long long)sb.stats().unprotected_pkts);
+    // ---- 拥塞控制闭环结果 ----
+    const auto ccst = gcc.snapshot();
+    printf("  [拥塞控制] 起始/最终码率: 16000 -> %d bps\n", last_adaptive_bps.load());
+    printf("  [拥塞控制] 延迟梯度=%.1f ms, 状态=%s, 增%llu/降%llu 次\n",
+           ccst.delay_gradient_ms, CongestionController::state_name(ccst.state),
+           (unsigned long long)ccst.increase_events,
+           (unsigned long long)ccst.decrease_events);
+    printf("  [拥塞控制] 编码器当前码率: %d bps\n", codec_a.bitrate());
 
     // 关键断言
     CHECK(sent_ok.load() > 0, "发送了加密音频包");
@@ -455,6 +494,9 @@ int main(int argc, char** argv) {
     metrics.on_packets_lost(nst.lost_detected);
     metrics.on_recovered_nack(nst.recovered);
     metrics.on_nack_request(nst.nack_sent);
+    // 上报拥塞控制状态（闭环的可见性部分）
+    metrics.on_congestion(last_adaptive_bps.load(),
+                          gcc.snapshot().delay_gradient_ms);
     metrics.on_ice(ice_a.tx_count(), ice_b.rx_count(),
                    ice_a.connected() && ice_b.connected());
 
@@ -475,6 +517,13 @@ int main(int argc, char** argv) {
     printf("    恢复率=%.1f%%  仍缺失=%llu\n",
            mrec * 100.0, (unsigned long long)cm.still_missing());
     CHECK(mrec >= 0.0 && mrec <= 1.0, "恢复率落在 [0,1] 区间");
+
+    // 拥塞控制闭环校验：目标码率必须非零且落在配置范围内
+    printf("    拥塞控制目标码率=%d bps\n", cm.target_bitrate_bps);
+    CHECK(cm.target_bitrate_bps >= 6000 && cm.target_bitrate_bps <= 48000,
+          "拥塞控制目标码率落在 [6000, 48000] 内");
+    CHECK(cm.target_bitrate_bps == last_adaptive_bps.load(),
+          "指标里的目标码率 == 拥塞控制的输出（闭环已接通）");
 
     const double mcont = cm.playout_continuity();
     printf("    播放连续性=%.1f%%\n", mcont * 100.0);

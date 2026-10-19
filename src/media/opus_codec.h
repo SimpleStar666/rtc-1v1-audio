@@ -45,6 +45,16 @@ public:
                              std::vector<std::vector<uint8_t>>* out_frames);
 
     int  bitrate() const { return bitrate_; }
+
+    // 运行时调整目标码率 —— 拥塞控制闭环的关键接口。
+    //
+    // 为什么必须支持运行时调整：
+    //   拥塞控制（GCC）要"测量 -> 决策 -> 生效"闭环，生效环节就是改编码码率。
+    //   如果码率只能在 init 时设定，自适应就只是"算出目标值但无作用"。
+    //
+    // 实现要点：Opus 用 OPUS_SET_BITRATE_REQUEST 控制项 + 独立的值参数，
+    // 不能写成 OPUS_SET_BITRATE(x)（宏展开为两个参数，见坑 3）。
+    bool set_bitrate(int bps);
     bool inband_fec() const { return inband_fec_; }
 
     // 编码统计（用于指标上报）

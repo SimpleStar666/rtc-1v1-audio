@@ -13,7 +13,17 @@ constexpr const char* kTag = "metrics";
 // ---------------- 派生指标 ----------------
 int CallMetrics::actual_bitrate_bps() const {
     if (duration_ms <= 0) return 0;
-    return int(double(bytes_sent) * 8.0 * 1000.0 / double(duration_ms));
+    return int(double(payload_bytes) * 8.0 * 1000.0 / double(duration_ms));
+}
+
+int CallMetrics::wire_bitrate_bps() const {
+    if (duration_ms <= 0) return 0;
+    return int(double(wire_bytes) * 8.0 * 1000.0 / double(duration_ms));
+}
+
+double CallMetrics::overhead_ratio() const {
+    if (payload_bytes == 0) return 0.0;
+    return double(wire_bytes) / double(payload_bytes);
 }
 
 double CallMetrics::recovery_rate() const {
@@ -53,7 +63,8 @@ std::string CallMetrics::to_string() const {
         "    采集帧数        : %llu\n"
         "    编码成功/错误   : %llu / %llu  (成功率 %.1f%%)\n"
         "    RTP 包/FEC 包   : %llu / %llu\n"
-        "    发送字节        : %llu  (实测码率 %d bps)\n"
+        "    载荷/网络字节   : %llu / %llu\n"
+        "    编码码率/实际码率: %d / %d bps  (开销比 %.2f)\n"
         "    NACK 请求/重传  : %llu / %llu\n"
         "  [接收侧]\n"
         "    接收包数        : %llu\n"
@@ -79,7 +90,8 @@ std::string CallMetrics::to_string() const {
         (unsigned long long)frames_encoded, (unsigned long long)encode_errors,
         encode_success_rate() * 100.0,
         (unsigned long long)packets_sent, (unsigned long long)fec_packets_sent,
-        (unsigned long long)bytes_sent, actual_bitrate_bps(),
+        (unsigned long long)payload_bytes, (unsigned long long)wire_bytes,
+        actual_bitrate_bps(), wire_bitrate_bps(), overhead_ratio(),
         (unsigned long long)nack_requests, (unsigned long long)retransmitted_packets,
         (unsigned long long)packets_received,
         (unsigned long long)packets_lost, loss_rate * 100.0,
@@ -104,8 +116,10 @@ std::string CallMetrics::to_json() const {
     snprintf(buf, sizeof(buf),
         "{\"duration_ms\":%lld,"
         "\"frames_captured\":%llu,\"frames_encoded\":%llu,\"encode_errors\":%llu,"
-        "\"packets_sent\":%llu,\"fec_packets_sent\":%llu,\"bytes_sent\":%llu,"
-        "\"bitrate_bps\":%d,\"nack_requests\":%llu,\"retransmitted\":%llu,"
+        "\"packets_sent\":%llu,\"fec_packets_sent\":%llu,"
+        "\"payload_bytes\":%llu,\"wire_bytes\":%llu,"
+        "\"bitrate_bps\":%d,\"wire_bitrate_bps\":%d,\"overhead_ratio\":%.3f,"
+        "\"nack_requests\":%llu,\"retransmitted\":%llu,"
         "\"packets_received\":%llu,\"packets_lost\":%llu,\"loss_rate\":%.4f,"
         "\"recovered_nack\":%llu,\"recovered_fec\":%llu,\"recovery_rate\":%.4f,"
         "\"jb_received\":%llu,\"jb_played\":%llu,\"jb_plc\":%llu,"
@@ -121,8 +135,11 @@ std::string CallMetrics::to_json() const {
         (unsigned long long)encode_errors,
         (unsigned long long)packets_sent,
         (unsigned long long)fec_packets_sent,
-        (unsigned long long)bytes_sent,
+        (unsigned long long)payload_bytes,
+        (unsigned long long)wire_bytes,
         actual_bitrate_bps(),
+        wire_bitrate_bps(),
+        overhead_ratio(),
         (unsigned long long)nack_requests,
         (unsigned long long)retransmitted_packets,
         (unsigned long long)packets_received,
@@ -169,7 +186,7 @@ void MetricsCollector::on_frame_captured() {
 
 void MetricsCollector::on_frame_encoded(bool ok, size_t bytes) {
     std::lock_guard<std::mutex> lk(m_);
-    if (ok) { c_.frames_encoded++; c_.bytes_sent += bytes; }
+    if (ok) { c_.frames_encoded++; c_.payload_bytes += bytes; }
     else    { c_.encode_errors++; }
 }
 
@@ -177,13 +194,13 @@ void MetricsCollector::on_packet_sent(size_t bytes, bool is_fec) {
     std::lock_guard<std::mutex> lk(m_);
     if (is_fec) { c_.fec_packets_sent++; }
     else        { c_.packets_sent++; }
-    c_.bytes_sent += bytes;
+    c_.wire_bytes += bytes;   // 只累加网络字节
 }
 
 void MetricsCollector::on_retransmit(size_t bytes) {
     std::lock_guard<std::mutex> lk(m_);
     c_.retransmitted_packets++;
-    c_.bytes_sent += bytes;
+    c_.wire_bytes += bytes;
 }
 
 void MetricsCollector::on_nack_request(size_t count) {
