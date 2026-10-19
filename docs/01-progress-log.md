@@ -170,19 +170,84 @@ NetEq 做 **sample 级时间拉伸**（accelerate / preemptive expand）；
 ### 编译产物
 
 ```
-selftest       2.1 MB   自检
+selftest       2.2 MB   自检（6 组测试）
 signal_server  1.7 MB   WebSocket 信令服务器
-peer           1.7 MB   通话端点（loopback 模式可用）
-weaknet_test   0.77 MB  弱网测试工具
+peer           1.8 MB   通话端点（loopback 模式可用）
+weaknet_test   0.83 MB  弱网测试工具
 ```
+
+### 端到端自环验证
+
+```bash
+./build/peer --loopback --seconds 5
+```
+
+```
+--- 自环结果（5 秒）---
+  发送包数      : 84
+  自环回灌包数  : 84
+  接收包数      : 84
+  编码错误      : 0
+  解码错误      : 0
+  抖动缓冲接收  : 252
+  播放帧数      : 246
+  PLC 补偿      : 0
+  目标延迟      : 81 ms
+  实测码率      : 16.0 kbps
+
+✅ 自环验证通过：媒体链路端到端可用
+```
+
+**意义**：编码 → 序列化 → 反序列化 → 抖动缓冲 → 解码 → 播放
+这条完整链路在本地跑通，不依赖网络。网络部分出问题时，
+可以先用 loopback 判断"是媒体链路的问题，还是网络的问题"——这是一个实用的隔离手段。
+
+### 远程验证（最终证据）
+
+从 GitHub 全新克隆后重新构建，确认仓库内容真实可用：
+
+```bash
+git clone https://github.com/SimpleStar666/rtc-1v1-audio.git
+cd rtc-1v1-audio && ./scripts/build.sh && ./build/selftest
+```
+
+```
+✅ 克隆成功（36 个文件，不含 build/）
+✅ 编译成功（4 个可执行文件）
+✅ 自检 6 组全部通过
+✅ 弱网测试：丢包 38 → 检测 38（精确吻合）
+✅ 端到端自环：51 包收发、0 错误、0 PLC
+```
+
+### 仓库地址
+
+https://github.com/SimpleStar666/rtc-1v1-audio
+
+---
+
+## Phase 1 完成度总结
+
+| 组件 | 状态 | 验证方式 |
+|---|---|---|
+| Opus 编解码封装 | ✅ | SNR 29.8dB、码率 16.0kbps |
+| 多帧拼包 | ✅ | 拼包/解包内容一致 |
+| 包格式 + CRC | ✅ | 序列化往返 + 损坏包被拒 |
+| 抖动缓冲 | ✅ | 乱序接受、重复拒绝、丢包精确统计 |
+| 虚拟音频设备 | ✅ | 采集节拍精确（无漂移） |
+| 音频管线 | ✅ | 端到端自环 84 包 0 错误 |
+| 信令消息 | ✅ | JSON 往返一致 |
+| 信令服务器 | ✅ | 已编译，待联调 |
+| 文档体系 | ✅ | 架构/进度/踩坑/验证 4 篇 |
+
+**踩坑 14 项**，其中 5 项为设计级（坑 1、9、10、11、12），均已修复并量化验证。
 
 ---
 
 ## 下一步（Phase 2+）
 
-- [ ] Phase 2：完善音频管线（聚合准确性、统计上报）
-- [ ] Phase 3：WebSocket 信令客户端接入
-- [ ] Phase 4：libnice ICE / STUN 穿透
-- [ ] Phase 5：DTLS-SRTP 加密
-- [ ] Phase 6：弱网对抗（NACK / FEC / 拥塞控制）
-- [ ] Phase 7：端到端联调 + 指标统计
+- [ ] Phase 2：WebSocket 信令客户端接入（连接 signal_server，交换 SDP/候选）
+- [ ] Phase 3：libnice ICE / STUN 穿透（替换 loopback 直连）
+- [ ] Phase 4：DTLS-SRTP 加密（libsrtp2 + OpenSSL）
+- [ ] Phase 5：弱网对抗（NACK / FEC / 拥塞控制）
+- [ ] Phase 6：端到端联调 + 指标上报
+
