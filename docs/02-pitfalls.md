@@ -1,6 +1,6 @@
 # 踩坑记录
 
-> 真实遇到的报错、误判和修复过程，共 11 个坑。
+> 真实遇到的报错、误判和修复过程，共 20 个坑。
 > 这些是最有价值的部分——面试时"你踩过什么坑"考的就是这些。
 
 **速览**：
@@ -18,8 +18,18 @@
 | 9 | **组件内部读真实时钟，无法测试** | **可测试性设计** | 测试全为 0 |
 | 10 | **目标延迟只跟平滑抖动** | **算法设计** | 接受率仅 43% |
 | 11 | **丢包统计按到达顺序累加** | **统计口径** | 虚报 6 倍丢包 |
+| 12 | `std::mutex` 非递归 → 自死锁 | 并发 | 进程卡死 |
+| 13 | 虚拟播放设备只写不读 | 实现疏漏 | 缓冲爆满刷屏 |
+| 14 | 条件变量固定超时 → 帧率损失 | 并发 | 5 秒少 5 帧 |
+| 15 | lws `opaque_user_data` 未设置 | C/C++ 混用 | 回调拿不到对象 |
+| 16 | **subprotocol 名两端不一致** | C/C++ 混用 | 握手被拒 |
+| 17 | **裸内存里放 std::string** | C/C++ 混用 | 段错误 |
+| 18 | **`lws_write` 未预留 LWS_PRE** | C/C++ 混用 | 堆越界崩溃 |
+| 19 | **消息竞态导致误判超时** | 时序 | 偶发失败 |
+| 20 | **发送缓冲覆盖式赋值** | 时序 | 消息丢失 |
 
-**最值得讲的三个：坑 9、坑 10、坑 11**——都是"发现→定位→量化验证"的完整闭环。
+**Phase 1 最值得讲的三个：坑 9、坑 10、坑 11**（算法与可测试性）
+**Phase 2 最值得讲的四个：坑 16、坑 17、坑 18、坑 20**（C 库与 C++ 混用）
 
 ---
 
@@ -586,24 +596,322 @@ s.lost = (span > arrived_distinct_) ? (span - arrived_distinct_) : 0;
 
 ---
 
-## 汇总：这 11 个坑的类型分布
+## 坑 15：libwebsockets 的 opaque_user_data 未设置
 
-| 类型 | 坑 | 数量 |
+### 现象
+
+信令客户端连接后回调里拿不到 C++ 对象，`lws_get_opaque_user_data(wsi)` 返回 NULL。
+
+### 根因
+
+`lws_client_connect_info` 结构体里**漏了设置 `opaque_user_data`**：
+
+```cpp
+lws_client_connect_info ci;
+memset(&ci, 0, sizeof(ci));
+ci.context = ctx;
+ci.address = host_.c_str();
+// ... 但没有 ci.opaque_user_data = this;
+```
+
+### 修复
+
+```cpp
+ci.opaque_user_data = this;   // 关键：让回调能找回 C++ 对象
+```
+
+### 为什么不用 per-session user data
+
+`connect` 返回前 session 尚未创建，因此无法在连接发起阶段填充 per-session
+user data。而 `opaque_user_data` 在整个连接生命周期内都有效。
+
+### 教训
+
+C 库的"回调 + 上下文指针"模式里，**上下文指针必须显式设置**，
+不要假定它会自动关联。`memset(&ci, 0, sizeof(ci))` 之后每一项都要检查。
+
+---
+
+## 坑 16：Subprotocol 名称两端不一致，握手失败
+
+### 现象
+
+客户端连接后立刻断开，服务器日志：
+
+```
+N: No supported protocol "rtc-signal-cli"
+```
+
+### 根因
+
+WebSocket 的 subprotocol 协商要求**两端协议名完全相同**：
+
+| 端 | 协议名 |
+|---|---|
+| 服务器 | `rtc-signal` |
+| 客户端 | `rtc-signal-cli` ← 多了 `-cli` 后缀 |
+
+libwebsockets 找不到匹配的协议就直接拒绝连接。
+
+### 修复
+
+客户端协议名改为与服务器一致：
+
+```cpp
+static const lws_protocols protocols[] = {
+    {"rtc-signal", client_callback, sizeof(PerSessionData), 4096, 0, nullptr, 0},
+    ...
+};
+```
+
+### 教训
+
+用 libwebsockets（或其他带 subprotocol 协商的库）时，
+**协议名应作为共享常量定义**，两端引用同一处，而不是各自硬编码字符串。
+
+---
+
+## 坑 17：在 libwebsockets 的 user data 里放 std::string → 段错误
+
+### 现象
+
+连接建立后立即段错误：
+
+```
+Thread 2 received signal SIGSEGV
+#0 std::string::_M_set_length (__n=0, this=0x7ffff002b8b8)
+#2 client_callback ... signaling_client.cpp:220
+```
+
+崩溃在 `data->rx.clear()`，而 `data` 就是 per-session user data。
+
+### 根因
+
+**libwebsockets 的 per-session user data 是它自己用 `malloc` 分配的裸内存**，
+不会调用 C++ 构造函数（也不会调析构函数）：
+
+```cpp
+struct PerSessionData {
+    SignalingClient* client = nullptr;
+    std::string      rx;      // ❌ 内部指针是未初始化的野值
+};
+```
+
+`std::string` 的 `_M_data()` 指针来自构造函数初始化；在裸内存上，
+该指针是随机值。第一次 `clear()` 就访问野指针 → 段错误。
+
+### 修复
+
+**user data 里只放 POD 成员**，把 C++ 对象放到类自己的成员里：
+
+```cpp
+struct PerSessionData {
+    SignalingClient* client = nullptr;   // ✓ 仅指针，lws 会零初始化
+};
+
+// 接收缓冲改为 SignalingClient 的成员
+std::string& rx = client->rx_buffer();
+```
+
+### 对比：什么时候可以放 C++ 容器
+
+服务器端的 `Session` 是**自己 `new`/`delete` 管理的**，不是 lws 的裸内存，
+所以那里可以安全地持有 `std::vector` / `std::deque`：
+
+```cpp
+// 服务器（安全）
+Session* s = new Session();      // 构造被调用
+...
+delete s;                        // 析构被调用
+```
+
+**判断标准**：这块内存是谁分配的、生命周期谁管。
+由 C 库 malloc 的裸内存，只能放 POD。
+
+### 教训
+
+**C++ 对象不能放进 C 库管理的裸内存。**
+这是 C/C++ 混用最常见的崩溃来源，而且症状（段错误位置）与根因（对象未构造）距离很远，
+靠 gdb 回溯到 `std::string::clear()` 才看清。
+
+---
+
+## 坑 18：`lws_write` 未预留 LWS_PRE → 堆越界
+
+### 现象
+
+服务器在处理配对时崩溃：
+
+```
+double free or corruption (out)
+Aborted (core dumped)
+```
+
+### 根因
+
+libwebsockets 要求 `lws_write` 的缓冲区**前面必须预留 `LWS_PRE` 字节**
+（供它写 WebSocket 协议头）。早期版本直接传自己的缓冲裸指针：
+
+```cpp
+int n = lws_write(wsi, s->tx.data(), s->tx.size(), LWS_WRITE_TEXT);
+```
+
+libwebsockets 会往 `data()` 之前的内存写协议头 → **堆元数据被破坏** →
+后续 `free` 时报 "double free or corruption"。
+
+### 修复
+
+```cpp
+std::vector<uint8_t> outbuf(LWS_PRE + msg.size());
+memcpy(outbuf.data() + LWS_PRE, msg.data(), msg.size());
+int n = lws_write(wsi, outbuf.data() + LWS_PRE, msg.size(), LWS_WRITE_TEXT);
+```
+
+### 教训
+
+**堆越界的报错位置与出错位置通常相隔很远**（这里是在后续 free 时才报）。
+所以看到 "double free or corruption" 时，不要只盯着 free 的代码，
+要往前找**所有写缓冲区的地方**。
+
+`LWS_PRE` 这个要求在文档里，但容易漏——客户端和服务器两端都要注意。
+
+---
+
+## 坑 19：消息竞态导致一端误判"入房超时"
+
+### 现象
+
+两 peer 配对时，偶发一端报超时：
+
+```
+[peer B] 入房超时
+```
+
+但服务器日志显示 peer#2 确实入房成功了。
+
+### 根因
+
+服务器在处理 peer#2 的 join 时，**同一个处理流程里连续两次调用了 `queue_text`**：
+
+```cpp
+// 给入房者发 joined
+queue_text(wsi, joined.to_json());
+// 紧接着，发现对端在，再发 peer_ready
+if (peer) queue_text(wsi, ready.to_json());   // ← 覆盖了上一条
+```
+
+而当时 `queue_text` 用的是**单槽缓冲**（`s->tx.assign(...)`），
+第二次调用直接把第一条覆盖掉了。于是 peer#2 只收到 `peer_ready`、收不到 `joined`。
+
+**这是时序相关的**：两条消息间隔足够大时才不丢，所以表现为偶发。
+
+### 修复（两处）
+
+**(a) 服务器：发送缓冲改为队列**（见坑 20）
+
+**(b) 客户端：放宽等待条件**——不要死等某一个消息：
+
+```cpp
+// 旧：必须等到 joined
+for (...) if (joined) break;
+if (!joined) { 报超时; return 1; }
+
+// 新：joined 与 peer_ready 任一到达即视为配对成功（顺序不定）
+for (...) if (joined && peer_ready) break;
+if (!joined && !peer_ready) { 报超时; return 1; }
+```
+
+同时"信令面通过"的判定从"必须有候选"改为"(收到 offer 或 answer) 之一"——
+**主叫收 answer、被叫收 offer，两端不可能同时收到两者**。
+
+### 教训
+
+**"等待某条消息"的代码要问：这条消息一定会来吗？顺序确定吗？**
+网络消息的顺序通常不保证，严格的单点等待是脆弱设计。
+更稳的做法是等待"状态达成"（一组条件的组合），而不是"某个事件到达"。
+
+---
+
+## 坑 20：发送缓冲用覆盖式赋值 → 消息丢失
+
+### 现象
+
+同坑 19：服务器连续发两条消息时，先发的被后发的覆盖。
+
+### 根因
+
+```cpp
+struct Session {
+    std::vector<uint8_t> tx;   // 单槽
+};
+
+int queue_text(lws* wsi, const std::string& msg) {
+    s->tx.assign(msg.begin(), msg.end());   // ❌ 覆盖已有内容
+    lws_callback_on_writable(wsi);
+}
+```
+
+`assign()` 的语义是**替换**，不是追加。只要有两条消息在"写入回调尚未执行"
+的窗口内入队，第一条必然丢失。
+
+### 修复
+
+改为真正的队列：
+
+```cpp
+struct Session {
+    std::deque<std::string> tx;   // ✓ 队列
+};
+
+int queue_text(lws* wsi, const std::string& msg) {
+    s->tx.push_back(msg);          // 追加
+    lws_callback_on_writable(wsi);
+}
+
+// 可写回调里每次只发队首一条（lws_write 每次处理一条消息）
+case LWS_CALLBACK_SERVER_WRITEABLE: {
+    const std::string& msg = s->tx.front();
+    ... lws_write(...);
+    s->tx.pop_front();
+    if (!s->tx.empty()) lws_callback_on_writable(wsi);   // 还有就继续
+    break;
+}
+```
+
+### 教训
+
+**区分"赋值/覆盖"与"入队/追加"的语义**。
+凡是"待发送/待处理"的缓冲，默认应该是队列——
+除非能证明任何时刻最多只有一个元素（这里显然不成立，
+因为服务器在配对时会一次推送两条消息）。
+
+这类 bug 的特点是**在快速路径上不出现，只在时序紧的时候丢消息**，
+最难排查。用队列是低成本的根治手段。
+
+---
+
+## 汇总：这 20 个坑的类型分布
+
+| 类型 | 坑号 | 数量 |
 |---|---|---|
-| **逻辑/算法设计错误** | 坑 1（乱序误判）、坑 10（目标延迟低估）、坑 11（丢包统计算错） | **3** |
-| **可测试性设计缺陷** | 坑 9（内部读真实时钟） | 1 |
-| **测试方法错误** | 坑 2（Opus SNR 未对齐） | 1 |
-| **语言细节** | 坑 3（宏展开）、坑 7（头文件）、坑 8（重复声明） | 3 |
-| **环境/配置** | 坑 4（CMake）、坑 5（submodule）、坑 6（CA 证书） | 3 |
+| **逻辑/算法设计错误** | 1、10、11 | 3 |
+| **可测试性设计缺陷** | 9 | 1 |
+| **消息/并发时序问题** | 19、20 | 2 |
+| **C 库与 C++ 混用陷阱** | 15、16、17、18 | 4 |
+| **测试方法错误** | 2 | 1 |
+| **语言细节** | 3、7、8 | 3 |
+| **环境/配置** | 4、5、6 | 3 |
+| **其他实现疏漏** | 12、13、14 | 3 |
 
-### 最值得在面试中讲的三个
+### 最值得在面试中讲的
 
-1. **坑 1（乱序 vs 迟到）**——暴露"两个语义共用一个变量"的设计问题
-2. **坑 10（目标延迟跟平均值）**——暴露"调参看似正确但方向错了"的经典陷阱，
-   且修复后指标提升显著（接受率 43% → 99.8%）
-3. **坑 11（丢包统计口径）**——暴露"用事件顺序表达状态集合"的思维错误，
-   且修复后统计精确吻合真值
+1. **坑 1（乱序 vs 迟到）** —— "两个语义共用一个变量"的设计问题
+2. **坑 10（目标延迟跟平均值）** —— 修复后接受率 43% → 99.8%
+3. **坑 11（丢包统计口径）** —— 修复后与真值精确吻合
+4. **坑 17（裸内存里放 std::string）** —— C/C++ 混用的经典崩溃，靠 gdb 才定位
+5. **坑 20（覆盖式赋值丢消息）** —— 只在时序紧时出现的 bug，用队列根治
 
-这三个都是**"发现问题 → 定位根因 → 量化验证"**的完整闭环，
-而不是"报错改错"级别的修复。
+其中 1、10、11 是**算法级**的，17、20 是**架构级**的。
+四类问题的共同点：**都不是"报错改错"，而是需要理解系统语义才能定位**。
+
 

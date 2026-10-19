@@ -4,19 +4,19 @@
 
 ## 这个项目是什么
 
-一个**可运行的** 1v1 语音通话系统，包含信令、NAT 穿透、加密、编解码、抖动缓冲和弱网对抗。
-与"调 libwebrtc API"不同，本项目**用开源组件从零搭建每一层**，目的是把 RTC 的机制真正搞懂：
+一个**可运行的** 1v1 语音通话系统：信令、NAT 穿透、加密、编解码、抖动缓冲、弱网对抗。
+与"调 libwebrtc API"不同，本项目**用开源组件从零搭建每一层**，目的是把 RTC 的机制真正搞懂。
 
-| 层 | 选用组件 | 对应 WebRTC 中的 |
-|---|---|---|
-| 音频编解码 | **Opus** (libopus) | Opus（同一个编解码器） |
-| 抖动缓冲 / 播放调度 | 自研 | NetEq |
-| 音频设备 | 自研虚拟设备 | ADM (Audio Device Module) |
-| NAT 穿透 | **libnice** | ICE / STUN（同一套 RFC 8445/5389） |
-| 媒体加密 | **OpenSSL DTLS** + **libsrtp2** | DTLS-SRTP（同一套 RFC 5764） |
-| 信令 | **libwebsockets** | WebSocket 信令（WebRTC 标准不规定信令） |
-| 抗丢包 | 自研 NACK / FEC | NACK / ULPFEC |
-| 拥塞控制 | 自研 | GCC |
+| 层 | 选用组件 | 对应 WebRTC 中的 | 状态 |
+|---|---|---|---|
+| 音频编解码 | **Opus** (libopus) | Opus 编解码器 | ✅ 已实现并验证 |
+| 抖动缓冲 / 播放调度 | 自研 | **NetEq** | ✅ 已实现并验证 |
+| 音频设备 | 自研虚拟设备 | **ADM** | ✅ 已实现并验证 |
+| 信令 | **libwebsockets** | WebSocket 信令（标准不规定） | ✅ 两端配对已跑通 |
+| NAT 穿透 | **libnice** | ICE / STUN (RFC 8445/5389) | ⬜ Phase 3 |
+| 媒体加密 | **OpenSSL DTLS** + **libsrtp2** | DTLS-SRTP (RFC 5764) | ⬜ Phase 4 |
+| 抗丢包 | 自研 | NACK / ULPFEC | ✅ 抖动缓冲侧已实现 |
+| 拥塞控制 | 自研 | GCC | ⬜ Phase 5 |
 
 ## 为什么不用 libwebrtc
 
@@ -39,45 +39,87 @@ CMake   : 4.4.4 (pip 安装，系统自带 3.16 不满足新版依赖)
           libwebsockets-dev 3.2.1 / libssl-dev 1.1.1f
 ```
 
-**已知环境限制**（如实记录，见 `docs/03-verification.md`）：
+**已知环境限制**（如实记录，见 [docs/03-verification.md](docs/03-verification.md)）：
 - WSL 无 `/dev/snd` 声卡设备 → 用**虚拟音频设备**（文件/合成 PCM）替代真实麦克风与扬声器
-- `git` HTTPS 被 TLS 中间拦截 → 通过 GitHub API 推送（不影响项目本身）
 
 ## 文档导航
 
 | 文档 | 内容 |
 |---|---|
-| [docs/00-architecture.md](docs/00-architecture.md) | 整体架构与数据流 |
+| [docs/00-architecture.md](docs/00-architecture.md) | 整体架构、数据流、包格式与 RTP 的映射 |
 | [docs/01-progress-log.md](docs/01-progress-log.md) | **开发进度与重点记录**（每步做了什么、学到什么） |
-| [docs/02-pitfalls.md](docs/02-pitfalls.md) | **踩坑记录**（真实报错与解法） |
-| [docs/03-verification.md](docs/03-verification.md) | 验证数据与实测结果 |
+| [docs/02-pitfalls.md](docs/02-pitfalls.md) | **踩坑记录（20 项，含真实报错与解法）** |
+| [docs/03-verification.md](docs/03-verification.md) | **验证数据与实测结果** |
 
 ## 构建
 
 ```bash
+sudo apt-get install -y libopus-dev libsrtp2-dev libnice-dev \
+  libwebsockets-dev libglib2.0-dev libssl-dev pkg-config
+python3 -m pip install --user "cmake>=3.28"
+export PATH=$HOME/.local/bin:$PATH
+
 cd rtc-1v1-audio
 ./scripts/build.sh
 ```
 
-## 运行（1v1 通话演示）
+## 运行
 
 ```bash
-# 终端 1：信令服务器
-./build/signal_server --port 8888
+# 自检（6 组组件测试）
+./build/selftest
 
-# 终端 2 / 3：两端客户端
-./build/peer --signal ws://127.0.0.1:8888 --room demo --audio-file assets/speech.pcm
+# 弱网测试（可指定丢包/抖动/延迟）
+./build/weaknet_test --loss 8 --jitter 30 --delay 60 --seconds 10
+
+# 本地媒体链路自环验证（不经网络）
+./build/peer --loopback --seconds 5
+
+# 信令配对测试（需先启动服务器）
+./build/signal_server --port 8888 &
+./build/peer --signal ws://127.0.0.1:8888 --room demo --name A --peer-test --seconds 3 &
+./build/peer --signal ws://127.0.0.1:8888 --room demo --name B --peer-test --seconds 3
+```
+
+## 实测结果摘要
+
+```
+自检 6 组：全部通过
+  Opus SNR 29.8 dB（16kbps），实测码率 16.0 kbps，算法延迟 26.9ms
+  采集节拍 25 帧/500ms（精确无漂移）
+
+弱网矩阵（5 用例）：检测丢包与实际丢包逐一吻合
+  0%  丢包 → 检测 0        2%  → 检测 6  （实际 6）
+  8%  丢包 → 检测 38       15% → 检测 67 （实际 67）
+  ±80ms 抖动 0 丢包 → 检测 0，接受率 99.8%
+
+端到端 loopback：84 包全部收发，0 编解码错误，0 PLC，码率 16.0kbps
+
+信令配对（两端 + 服务器）：
+  双向消息零丢失（joined / peer_ready / offer / answer / candidate）
+  服务器转发明细完整，无内存错误
 ```
 
 ## 进度
 
-- [x] Phase 0：环境侦察与依赖验证
-- [ ] Phase 1：项目骨架 + 构建系统
-- [ ] Phase 2：Opus 编解码封装 + 抖动缓冲
-- [ ] Phase 3：协议设计（包格式 / 序列化）
-- [ ] Phase 4：WebSocket 信令服务
-- [ ] Phase 5：ICE/STUN 穿透
-- [ ] Phase 6：DTLS-SRTP 加密
-- [ ] Phase 7：弱网对抗（NACK / FEC / 拥塞控制）
-- [ ] Phase 8：端到端集成 + 指标统计
+- [x] **Phase 0**：环境侦察与依赖验证
+- [x] **Phase 1**：媒体层（Opus / 抖动缓冲 / 虚拟设备 / 包格式）
+- [x] **Phase 2**：WebSocket 信令（客户端 + 服务器，两端配对已跑通）
+- [ ] Phase 3：libnice ICE / STUN 穿透
+- [ ] Phase 4：DTLS-SRTP 加密
+- [ ] Phase 5：弱网对抗（NACK / FEC / 拥塞控制）
+- [ ] Phase 6：端到端联调 + 指标统计
 
+## 目录结构
+
+```
+src/
+  common/    日志、字节序、CRC32 等工具
+  media/     Opus 封装、抖动缓冲（NetEq）、虚拟设备（ADM）、音频管线
+  protocol/  包格式（RTP 映射）、信令消息（JSON）
+  signal/    WebSocket 信令服务器 + 客户端
+  app/       通话端点（--loopback / --peer-test 两种模式）
+docs/        架构 / 进度 / 踩坑（20 项）/ 验证
+tests/       自检与弱网测试
+scripts/     构建与诊断脚本
+```

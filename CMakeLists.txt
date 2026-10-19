@@ -55,8 +55,16 @@ add_library(rtc_protocol STATIC
 target_include_directories(rtc_protocol PUBLIC src)
 target_link_libraries(rtc_protocol PUBLIC rtc_common)
 
+# ---------- 信令模块 ----------
+add_library(rtc_signal STATIC
+  src/signal/signaling_client.cpp
+)
+target_include_directories(rtc_signal PUBLIC src)
+target_link_libraries(rtc_signal PUBLIC rtc_common rtc_protocol ${LWS_LIBRARIES})
+target_include_directories(rtc_signal PRIVATE ${LWS_INCLUDE_DIRS})
+
 # ---------- 可执行目标（按阶段逐个加入）----------
-set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol pthread)
+set(RTC_EXE_LINK rtc_common rtc_media rtc_protocol rtc_signal pthread)
 
 add_executable(selftest tests/selftest.cpp)
 target_link_libraries(selftest PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES} ${SRTP2_LIBRARIES})

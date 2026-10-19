@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -37,9 +38,15 @@ struct Session {
     int                  peer_id = 0;
     std::string          room;
     bool                 in_room = false;
-    std::vector<uint8_t> rx;     // 接收缓冲（LWS 分帧重组）
-    std::vector<uint8_t> tx;     // 待发送缓冲
+    std::vector<uint8_t> rx;     // 接收重组（LWS 可能分片投递）
+    // 待发送队列。
+    // 早期版本是"单槽"（std::vector + assign），导致同一处理里连发两条时
+    // 后一条覆盖前一条（例如给入房者发 joined 之后紧接着发 peer_ready，
+    // joined 就丢了）。改为队列后不再丢失。见 docs/02-pitfalls.md 坑 20。
+    std::deque<std::string> tx;
     bool                 want_write = false;
+
+    Session() { rx.reserve(1024); }
 };
 
 std::mutex                        g_mutex;
@@ -52,11 +59,11 @@ Session* find_session(struct lws* wsi);
 // 把一个 peer 从房间移除，并通知同房间其他成员
 void leave_room(struct lws* wsi, Session* s, const char* reason);
 
-// 通过 wsi 发送一段文本（放到 tx 缓冲，触发可写回调）
+// 通过 wsi 发送一段文本（入队，触发可写回调）
 int queue_text(struct lws* wsi, const std::string& msg) {
     Session* s = find_session(wsi);
     if (!s) return -1;
-    s->tx.assign(msg.begin(), msg.end());
+    s->tx.push_back(msg);          // 入队（不覆盖）
     s->want_write = true;
     lws_callback_on_writable(wsi);
     return 0;
@@ -263,11 +270,28 @@ int callback_ws(struct lws* wsi, enum lws_callback_reasons reason,
         case LWS_CALLBACK_SERVER_WRITEABLE: {
             Session* s = find_session(wsi);
             if (!s || s->tx.empty()) break;
-            // 简化：一次写完（信令消息都很小，无需分片）
-            int n = lws_write(wsi, s->tx.data(), s->tx.size(), LWS_WRITE_TEXT);
-            LOGD(kTag, "peer#%d sent %d/%zu bytes", s->peer_id, n, s->tx.size());
-            s->tx.clear();
-            s->want_write = false;
+
+            // 取队首一条发送（不能一次全发：lws_write 每次只处理一条消息）
+            const std::string& msg = s->tx.front();
+
+            // 关键：lws_write 要求缓冲区前面预留 LWS_PRE 字节（协议头空间），
+            // 且这段空间必须可写。早期版本直接传 tx 的裸指针，
+            // libwebsockets 会往前面写协议头 → 堆越界 → "double free or corruption"。
+            // 见 docs/02-pitfalls.md 坑 18。
+            std::vector<uint8_t> outbuf(LWS_PRE + msg.size());
+            memcpy(outbuf.data() + LWS_PRE, msg.data(), msg.size());
+
+            int n = lws_write(wsi, outbuf.data() + LWS_PRE, msg.size(), LWS_WRITE_TEXT);
+            if (n < 0) {
+                LOGE(kTag, "peer#%d lws_write failed: %d", s->peer_id, n);
+            } else {
+                LOGD(kTag, "peer#%d sent %d/%zu bytes", s->peer_id, n, msg.size());
+            }
+            s->tx.pop_front();
+
+            // 队列还有积压就继续请求可写
+            if (!s->tx.empty()) lws_callback_on_writable(wsi);
+            else s->want_write = false;
             break;
         }
 

@@ -243,10 +243,80 @@ https://github.com/SimpleStar666/rtc-1v1-audio
 
 ---
 
-## 下一步（Phase 2+）
+## Phase 2：WebSocket 信令客户端接入
 
-- [ ] Phase 2：WebSocket 信令客户端接入（连接 signal_server，交换 SDP/候选）
-- [ ] Phase 3：libnice ICE / STUN 穿透（替换 loopback 直连）
+### 做了什么
+
+1. 实现 `SignalingClient`（libwebsockets 客户端封装）
+2. 在 `peer` 中加入 `--peer-test` 模式：两端通过服务器配对
+3. 端到端验证了信令交互（见下方实测日志）
+
+### 信令交互流程
+
+```
+peer A                          signal_server                        peer B
+   │                                  │                                 │
+   │── join(room=demo) ──────────────►│                                 │
+   │◄─ joined (members=1) ────────────│                                 │
+   │                                  │◄──────── join(room=demo) ───────│
+   │◄─ peer_ready ────────────────────│──── peer_ready ────────────────►│
+   │                                  │                                 │
+   │── offer(sdp) ───────────────────►│──── forwarded offer ───────────►│
+   │◄─ forwarded answer ──────────────│◄──── answer(sdp) ───────────────│
+   │◄─ forwarded candidate ───────────│◄──── candidate ─────────────────│
+   │── candidate ────────────────────►│──── forwarded candidate ───────►│
+```
+
+### 实测结果
+
+**服务器日志（转发明细）**：
+```
+peer#1 joined room 'demo' (1/2 members)
+peer#2 joined room 'demo' (2/2 members)
+room 'demo' paired: both peers ready
+forwarded offer      peer#1 -> peer#2  (169 bytes)
+forwarded answer     peer#2 -> peer#1  (170 bytes)
+forwarded candidate  peer#2 -> peer#1  (88 bytes)
+forwarded candidate  peer#1 -> peer#2  (88 bytes)
+```
+
+**两端信令状态**：
+```
+[peer A] 入房成功=是  对端就绪=是  收到 answer=是  收到候选=是  收发=4/3  ✅ 通过
+[peer B] 入房成功=是  对端就绪=是  收到 offer=是   收到候选=是  收发=4/3  ✅ 通过
+```
+
+**双向消息零丢失**——这是修复了"消息竞态"之后的结果（见坑 20）。
+
+### 本阶段踩的坑（4 个）
+
+| # | 坑 | 现象 | 根因 |
+|---|---|---|---|
+| 15 | opaque_user_data 未设置 | 回调拿不到 C++ 对象 | `connect_info` 里漏了 `opaque_user_data` |
+| 16 | **协议名不一致** | 服务器：`No supported protocol "rtc-signal-cli"` | 客户端写了 `rtc-signal-cli`，服务器是 `rtc-signal` |
+| 17 | **per-session user data 放 std::string** | 连接后立即段错误 | lws 的 user data 是 malloc 裸内存，不调用 C++ 构造函数 |
+| 18 | **lws_write 未预留 LWS_PRE** | `double free or corruption` | 缓冲区前部被 lws 写协议头 → 堆越界 |
+| 19 | 消息竞态导致误判超时 | 一端报"入房超时" | `joined` 被同批 `peer_ready` 覆盖（见坑 20） |
+| 20 | **发送缓冲是单槽（assign 覆盖）** | 一条消息被另一条覆盖丢失 | 应改为队列（`std::deque`），不得用覆盖式赋值 |
+
+**其中坑 16~18、20 是本阶段最有价值的四个**——都是 C 库与 C++ 混用的典型陷阱。
+
+### 验证方式
+
+```bash
+# 终端1：信令服务器
+./build/signal_server --port 8899
+
+# 终端2/3：两个端点配对
+./build/peer --signal ws://127.0.0.1:8899 --room demo --name A --peer-test --seconds 3
+./build/peer --signal ws://127.0.0.1:8899 --room demo --name B --peer-test --seconds 3
+```
+
+---
+
+## 下一步（Phase 3+）
+
+- [ ] Phase 3：libnice ICE / STUN 穿透（替换候选占位地址，打通真实 UDP 媒体通道）
 - [ ] Phase 4：DTLS-SRTP 加密（libsrtp2 + OpenSSL）
 - [ ] Phase 5：弱网对抗（NACK / FEC / 拥塞控制）
 - [ ] Phase 6：端到端联调 + 指标上报
