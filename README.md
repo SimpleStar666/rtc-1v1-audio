@@ -13,10 +13,11 @@
 | 抖动缓冲 / 播放调度 | 自研 | **NetEq** | ✅ 丢包检测精确吻合 |
 | 音频设备 | 自研虚拟设备 | **ADM** | ✅ 节拍无漂移 |
 | 信令 | **libwebsockets** | WebSocket 信令（标准不规定） | ✅ 两端配对零丢失 |
-| NAT 穿透 | **libnice** | ICE / STUN (RFC 8445/5389) | ✅ srflx×3 |
+| NAT 穿透 | **libnice** | ICE / STUN / **Trickle ICE** | ✅ srflx×3 + trickle 建链 |
 | 媒体加密 | **OpenSSL DTLS** + **libsrtp2** | DTLS-SRTP (RFC 5764) | ✅ 21 项通过 |
 | 抗丢包 | 自研 | NACK / ULPFEC | ✅ 恢复率 100%/89%/78%/52% |
 | 拥塞控制 | 自研 | GCC | ✅ 升/降/恢复全通过 |
+| 指标统计 | 自研 | `getStats()` / RTCP SR·RR | ✅ 跨层自洽校验 |
 
 **端到端链路**（Phase 6 验收）：
 
@@ -118,7 +119,26 @@ DTLS-SRTP（21 项全部通过）：
   无丢包：SRTP 加密/解密 62/62，解密失败 0，PLC 0，解码最大幅度 8218
   丢包矩阵：模拟丢弃 3/4/6 → 检测丢包 3/4/6（精确吻合）
             PLC 补偿 9/12/18（随丢包率上升）
+
+Trickle ICE（候选增量发送）：
+  A/B 各 trickle 36 个候选，增量添加 36/36 成功，建链后双向收发正常
+
+统一指标统计（对应 getStats）：
+  [发送侧] 采集 151 / 编码 151(100%) / RTP 50 / FEC 12 / 38401 bps
+  [接收侧] 接收 62 / 检测丢包 0 / 恢复率 100%
+  [抖动缓冲] 接收 150 / 播放 146 / PLC 0 / 连续性 100% / 目标 80ms
+  [加密] SRTP 加密 62 / 解密 62 (失败 0)
+  跨层自洽：62 == 62，50+12 == 62，接收 == 发送
 ```
+
+## 简历个人项目描述对照
+
+| # | 描述 | 实测证据 |
+|---|---|---|
+| ① | WebSocket 信令（offer/answer/ICE 转发、**Trickle ICE**） | 两端配对零丢失；trickle 36/36 建链 |
+| ② | STUN/ICE 穿透与 **DTLS-SRTP 加密** | srflx×3；双向指纹互验；62/62 解密 |
+| ③ | **Opus 编解码 + 抖动缓冲** | SNR 29.8dB / 16kbps；丢包检测精确吻合 |
+| ④ | 弱网对抗（**NACK/FEC/码率自适应**）与**指标统计** | 恢复率 100%/89%/78%/52%；跨层自洽指标 |
 
 ## 进度
 
@@ -129,6 +149,7 @@ DTLS-SRTP（21 项全部通过）：
 - [x] **Phase 4**：DTLS-SRTP 媒体加密（21 项验证通过）
 - [x] **Phase 5**：弱网对抗（NACK / FEC / 拥塞控制）
 - [x] **Phase 6**：端到端集成（音频经 ICE + DTLS-SRTP 完整链路）
+- [x] **补充**：Trickle ICE + 统一指标统计
 
 ## 已知边界（如实声明）
 
@@ -148,11 +169,12 @@ src/
   media/     Opus 封装、抖动缓冲（NetEq）、虚拟设备（ADM）、音频管线
   protocol/  RTP 兼容包格式、信令消息（JSON）
   signal/    WebSocket 信令服务器 + 客户端
-  ice/       ICE / STUN 穿透（libnice 封装）
+  ice/       ICE / STUN / Trickle ICE（libnice 封装）
   crypto/    DTLS-SRTP 加密（OpenSSL + libsrtp2）
   net/       弱网对抗（NACK / FEC / 拥塞控制）
+  metrics/   统一指标统计（对应 getStats）
   app/       通话端点（--loopback / --peer-test 两种模式）
-docs/        架构 / 进度 / 踩坑（30 项）/ 验证
-tests/       自检、弱网、ICE、DTLS-SRTP、抗损、端到端
+docs/        架构 / 进度 / 踩坑（32 项）/ 验证
+tests/       自检、弱网、ICE、DTLS-SRTP、抗损、指标、端到端
 scripts/     构建、诊断与验证脚本
 ```
