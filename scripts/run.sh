@@ -65,7 +65,7 @@ do_test() {
   cd "$BUILD"
   local fail=0
   run() {
-    printf "  %-24s" "$1"; shift
+    printf "  %-26s" "$1"; shift
     local out; out=$(timeout 120 "$@" 2>&1); local rc=$?
     local last; last=$(echo "$out" | grep -E "结果：" | tail -1 | sed 's/^#* *//')
     [ -n "$last" ] && echo "$last" || { echo "rc=$rc"; }
@@ -169,11 +169,12 @@ do_call() {
 
   echo ""
   title "端点 A（主叫）"
-  grep -E "已入房|对端就绪|我发 offer|收到 answer|收到候选" /tmp/rtc_A.log | sed 's/^/    /'
+  # 只取带 [A] 前缀的过程行（避免与下面"信令面结果"行重复匹配）
+  grep -E "^[[:space:]]*\[A\]" /tmp/rtc_A.log | sed 's/^/    /'
   grep -E "信令面结果" /tmp/rtc_A.log | tail -1 | sed 's/^/    /'
   echo ""
   title "端点 B（被叫）"
-  grep -E "已入房|对端就绪|收到 offer|已回 answer|收到候选" /tmp/rtc_B.log | sed 's/^/    /'
+  grep -E "^[[:space:]]*\[B\]" /tmp/rtc_B.log | sed 's/^/    /'
   grep -E "信令面结果" /tmp/rtc_B.log | tail -1 | sed 's/^/    /'
   echo ""
   title "服务器转发记录"
