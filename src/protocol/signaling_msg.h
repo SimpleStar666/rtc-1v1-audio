@@ -40,9 +40,24 @@ struct SignalMsg {
     // 会话描述（offer/answer）
     std::string sdp;
     // ICE 候选
-    std::string candidate;   // "ip:port"
+    std::string candidate;   // "ip:port" 或 a=candidate:... 的 SDP 片段
     std::string mid;         // 媒体标识
     int         mline_index = 0;
+
+    // ---- ICE 凭证（真实通话必需）----
+    //
+    // 为什么必须用独立字段、而不是塞进 sdp 字符串再解析：
+    //   libnice 生成的 ufrag/pwd 是随机串，可能含 '+' '/' '=' 等字符
+    //   （实测 pwd 里出现过 '/'）。若用 "ufrag=xxx;pwd=yyy" 这种拼接格式，
+    //   '=' 会把 key=value 切错。用独立 JSON 字段最稳。
+    //
+    // 见 docs/02-pitfalls.md 坑 31（Trickle ICE 必须交换凭证）。
+    std::string ice_ufrag;
+    std::string ice_pwd;
+
+    // ---- DTLS 证书指纹（防 MITM）----
+    // 格式 "AA:BB:CC:..."（SHA-256），对应 SDP 的 a=fingerprint 行。
+    std::string fingerprint;
 
     // 错误信息
     std::string reason;

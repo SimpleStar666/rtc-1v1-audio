@@ -103,7 +103,7 @@ add_executable(signal_server src/signal/signal_server.cpp)
 target_link_libraries(signal_server PRIVATE ${RTC_EXE_LINK} ${LWS_LIBRARIES} ${GLIB_LIBRARIES})
 target_include_directories(signal_server PRIVATE ${LWS_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS})
 
-add_executable(peer src/app/peer.cpp)
+add_executable(peer src/app/peer.cpp src/app/call_session.cpp)
 target_link_libraries(peer PRIVATE ${RTC_EXE_LINK}
   ${OPUS_LIBRARIES} ${SRTP2_LIBRARIES} ${NICE_LIBRARIES} ${LWS_LIBRARIES}
   ${GLIB_LIBRARIES} ${OPENSSL_LIBRARIES})

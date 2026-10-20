@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -81,8 +82,13 @@ public:
     // ------------------------------------------------------------------
 
     // 设置"每产生一个本地候选就回调"的处理器（对应 onicecandidate）
+    //
+    // ★ 注意时序：init() 内部就启动候选收集了，候选可能在
+    //   本函数被调用**之前**就已经产生。这些"早到的候选"会被
+    //   内部缓冲，并在注册回调的瞬间补发，不会丢。
+    //   见 docs/02-pitfalls.md 坑 38。
     using TrickleCallback = std::function<void(const std::string& candidate_sdp)>;
-    void set_on_trickle_candidate(TrickleCallback cb) { on_trickle_ = std::move(cb); }
+    void set_on_trickle_candidate(TrickleCallback cb);
 
     // 增量添加一个远端候选（对应 addIceCandidate）。
     // candidate_sdp 为单个候选的 SDP 片段（a=candidate:... 或含 a= 行）。
@@ -155,6 +161,10 @@ private:
     StateCallback     on_state_;
     TrickleCallback   on_trickle_;      // Trickle ICE：每个新候选的回调
     int               trickled_count_ = 0;
+    std::set<std::string> sent_candidates_;   // 已发过的候选（去重，见坑 37）
+    // 回调注册之前就已产生的候选（先攒着，注册时补发，见坑 38）
+    std::vector<std::string> early_candidates_;
+    mutable std::mutex       trickle_mutex_;
 
     std::atomic<bool> gathering_done_{false};
     std::atomic<bool> connected_{false};

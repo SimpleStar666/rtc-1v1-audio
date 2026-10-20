@@ -67,23 +67,60 @@ CMake   : 4.4.4 (pip 安装，系统自带 3.16 不满足新版依赖)
 ./scripts/run.sh build      # 编译
 ./scripts/run.sh test       # 全部测试
 ./scripts/run.sh loopback   # 本地自环，会播放音频给你听
-./scripts/run.sh call       # 双端真实通话（自动起服务器 + A/B 配对）
+./scripts/run.sh call       # ★ 双端真实通话（两个进程互传音频，可听到对方）
 ./scripts/run.sh weaknet    # 弱网矩阵（丢包 0/2/5/8/15% 对照）
 ./scripts/run.sh help       # 全部命令说明
+```
+
+### 真正的通话长什么样
+
+`./scripts/run.sh call` 会启动**两个独立进程**，完整跑一遍
+信令 → ICE → DTLS-SRTP → 双向音频：
+
+```
+A 端: 发送 134 包 / 接收 134 包 / SRTP 解密 134 包（失败 0）
+B 端: 发送 136 包 / 接收 134 包 / SRTP 解密 134 包（失败 0）
+两端退出码 = 0
+```
+
+并且**自动验证"听到的是对方"**（而不是各自自环）：
+A 采集扫频、B 采集 440Hz 单音，最后给出的录音里
+
+| 端点 | 采集源 | 录到的主导频率 | 说明 |
+|---|---|---|---|
+| A | 扫频 200→3000Hz | **440 Hz** | A 录到的是 B 的声音 |
+| B | 440 Hz 单音 | **~2400 Hz** | B 录到的是 A 的扫频 |
+
+```bash
+# 也可以手工跑（三个终端）
+./build/signal_server --port 8899
+./build/peer --call --signal ws://127.0.0.1:8899 --room demo --name A --seconds 8 \
+  --audio-file /tmp/rtc_demo/sweep.pcm --out /tmp/call_A.pcm
+./build/peer --call --signal ws://127.0.0.1:8899 --room demo --name B --seconds 8 \
+  --audio-file /tmp/rtc_demo/sine440.pcm --out /tmp/call_B.pcm
+
+# 试听（转 WAV 后播放）
+python3 /tmp/rtc_demo/pcm2wav.py /tmp/call_A.pcm /tmp/call_A.wav 16000
+paplay /tmp/call_A.wav
 ```
 
 > **完整操作手册（怎么跑、怎么玩、怎么演示）见
 > [docs/04-how-to-run.md](docs/04-how-to-run.md)** —— 含环境准备、
 > 逐命令详解、各组件单独运行、听声音、面试演示脚本、常见问题、命令速查表。
+>
+> **想知道每段代码怎么实现的，见
+> [docs/05-code-tour.md](docs/05-code-tour.md)** —— 10 个模块逐个讲
+> "要实现什么 / 代码在哪（文件:行号）/ 关键算法 / 设计取舍 / 对应踩坑"。
 
 ## 文档导航
 
 | 文档 | 内容 |
 |---|---|
 | [**docs/04-how-to-run.md**](docs/04-how-to-run.md) | **操作手册：怎么跑、怎么玩、怎么演示** |
+| [**docs/05-code-tour.md**](docs/05-code-tour.md) | **代码导读：每个功能怎么实现、代码在哪、为什么这么写** |
 | [docs/00-architecture.md](docs/00-architecture.md) | 整体架构、数据流、包格式与 RTP 的映射 |
 | [docs/01-progress-log.md](docs/01-progress-log.md) | 开发进度与重点记录（每步做了什么、学到什么） |
-| [docs/02-pitfalls.md](docs/02-pitfalls.md) | **踩坑记录（34 项，含真实报错与解法）** |
+| [docs/02-pitfalls.md](docs/02-pitfalls.md) | **踩坑记录（38 项，含真实报错与解法）** |
 | [docs/03-verification.md](docs/03-verification.md) | **验证数据与实测结果** |
 
 ## 构建

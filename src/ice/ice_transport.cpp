@@ -141,28 +141,67 @@ void IceTransport::cb_recv(NiceAgent* agent, unsigned int stream_id, unsigned in
 //
 // 对应 WebRTC 的 onicecandidate 事件——候选一产生就发信令，
 // 不等收集完成。这能把建链时间从"最慢候选"缩短到"最先可用候选"。
+//
+// ★ 关键：必须**只发新增的那个候选**。
+//
+//   libnice 的 new-candidate 信号只告知"有新候选"，不告诉你是哪一个。
+//   早期实现在回调里遍历 nice_agent_get_local_candidates() 的**全部**候选
+//   并发出去 —— 结果每来一个新候选就把已有的全部重发一遍：
+//   6 个候选被发了 36 次（实测日志 trickle candidate #1..#36）。
+//   这会让对端重复添加候选、浪费信令带宽。
+//
+//   正确做法：记录已发过的候选 SDP，只发新的。
+//   见 docs/02-pitfalls.md 坑 37。
+// 设置 trickle 回调。
+//
+// 必须处理"早到的候选"：init() 内部就调用了 nice_agent_gather_candidates，
+// 候选可能在调用方注册回调之前就已经产生。若不缓冲，这些候选会永久丢失
+// —— 表现为"trickle 日志说有候选，但对端一个都没收到"，ICE 永远连不通。
+// 见 docs/02-pitfalls.md 坑 38。
+void IceTransport::set_on_trickle_candidate(TrickleCallback cb) {
+    std::lock_guard<std::mutex> lk(trickle_mutex_);
+    on_trickle_ = std::move(cb);
+    if (on_trickle_) {
+        for (const auto& c : early_candidates_) {
+            LOGI(kTag, "replay early trickle candidate: %.70s", c.c_str());
+            on_trickle_(c);
+        }
+        early_candidates_.clear();
+    }
+}
+
 void IceTransport::cb_new_candidate(NiceAgent* agent, unsigned int stream_id,
                                     unsigned int component_id, char* foundation,
                                     void* user_data) {
     auto* self = static_cast<IceTransport*>(user_data);
 
-    // 用 libnice 的 API 把这个候选转成 SDP 片段（a=candidate:...）
+    // 用 libnice 的 API 把这些候选转成 SDP 片段（a=candidate:...）
     GSList* cands = nice_agent_get_local_candidates(agent, stream_id, component_id);
     if (!cands) return;
+
+    std::lock_guard<std::mutex> lk(self->trickle_mutex_);
 
     for (GSList* it = cands; it; it = it->next) {
         auto* c = static_cast<NiceCandidate*>(it->data);
         gchar* sdp = nice_agent_generate_local_candidate_sdp(agent, c);
         if (!sdp) continue;
 
+        const std::string frag(sdp);
+        g_free(sdp);
+
+        // 去重：已经发过的跳过
+        if (self->sent_candidates_.count(frag)) continue;
+        self->sent_candidates_.insert(frag);
+
         self->trickled_count_++;
-        LOGI(kTag, "trickle candidate #%d: %s", self->trickled_count_,
-             sdp[0] ? sdp : "?");
+        LOGI(kTag, "trickle candidate #%d: %s", self->trickled_count_, frag.c_str());
 
         if (self->on_trickle_) {
-            self->on_trickle_(std::string(sdp));
+            self->on_trickle_(frag);
+        } else {
+            // 回调还没注册：先攒起来，注册时补发
+            self->early_candidates_.push_back(frag);
         }
-        g_free(sdp);
     }
     g_slist_free_full(cands, reinterpret_cast<GDestroyNotify>(nice_candidate_free));
 }

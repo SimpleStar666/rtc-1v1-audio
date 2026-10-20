@@ -170,6 +170,10 @@ std::string SignalMsg::to_json() const {
     if (!mid.empty())       j.set("mid", mid);
     j.set("mline", mline_index);
     if (!reason.empty())    j.set("reason", reason);
+    // ICE 凭证 + DTLS 指纹（offer/answer 里交换）
+    if (!ice_ufrag.empty())   j.set("ice_ufrag", ice_ufrag);
+    if (!ice_pwd.empty())     j.set("ice_pwd", ice_pwd);
+    if (!fingerprint.empty()) j.set("fingerprint", fingerprint);
     if (type == SignalType::kOffer || type == SignalType::kAnswer) {
         j.set("codec", codec);
         j.set("sample_rate", sample_rate);
@@ -213,6 +217,9 @@ bool SignalMsg::from_json(const std::string& json, SignalMsg* out) {
     get("mid", &out->mid);
     get_int("mline", &out->mline_index);
     get("reason", &out->reason);
+    get("ice_ufrag", &out->ice_ufrag);
+    get("ice_pwd", &out->ice_pwd);
+    get("fingerprint", &out->fingerprint);
     get("codec", &out->codec);
     get_int("sample_rate", &out->sample_rate);
     get_int("channels", &out->channels);

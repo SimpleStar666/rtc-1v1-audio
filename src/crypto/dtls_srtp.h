@@ -67,8 +67,24 @@ public:
     DtlsSrtpSession();
     ~DtlsSrtpSession();
 
-    // 执行 DTLS 握手并完成 SRTP 密钥派生。成功返回 true。
+    // ---- 两阶段用法（真实通话必需）----
+    //
+    // 为什么拆成两步：
+    //   信令交换需要**先**拿到自己的证书指纹（写进 offer/answer 发给对端），
+    //   然后才能开始握手。如果只在 handshake() 里创建证书，
+    //   调用方在交换信令时拿不到指纹，就无法做防 MITM 的指纹校验。
+    //
+    // 用法：
+    //   prepare(is_client)            -> 创建证书/SSL，可读 local_fingerprint()
+    //   （经信令交换 sdp，拿到对端指纹）
+    //   handshake(transport, peer_fp) -> 做握手 + 校验 + 派生 SRTP 密钥
+    bool prepare(bool is_client, int handshake_timeout_ms = 10000);
+    bool handshake(DtlsTransport* transport, const std::string& peer_fingerprint);
+
+    // ---- 一步到位（测试用；内部会自动先 prepare）----
     bool handshake(DtlsTransport* transport, const Config& cfg);
+
+    bool prepared() const { return ssl_ != nullptr; }
 
     // 本地证书指纹（十六进制，用于经信令告知对端）
     std::string local_fingerprint() const { return local_fingerprint_; }
@@ -112,6 +128,7 @@ private:
     srtp_t srtp_out_ = nullptr;   // 加密（发送方向）
 
     bool        is_client_ = true;
+    int         handshake_timeout_ms_ = 10000;
     std::string local_fingerprint_;
     std::string peer_fingerprint_;
     std::string peer_fingerprint_expected_;

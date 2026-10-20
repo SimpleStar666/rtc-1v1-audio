@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "app/call_session.h"
 #include "common/logging.h"
 #include "common/util.h"
 #include "media/audio_pipeline.h"
@@ -33,7 +34,8 @@ struct Args {
     int         bitrate = 16000;
     int         jb_target = 60;
     bool        loopback = false;           // 本地自环：不经过网络
-    bool        peer_test = false;          // 双端信令配对测试
+    bool        peer_test = false;          // 仅信令配对（诊断用）
+    bool        call = false;               // 完整通话（真实媒体传输）
 };
 
 Args parse(int argc, char** argv) {
@@ -50,6 +52,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--jb" && i + 1 < argc) a.jb_target = atoi(argv[++i]);
         else if (k == "--loopback") a.loopback = true;
         else if (k == "--peer-test") a.peer_test = true;
+        else if (k == "--call") a.call = true;
         else if (k == "--verbose") set_log_level(LogLevel::kDebug);
     }
     return a;
@@ -65,8 +68,12 @@ void usage() {
     printf("  --seconds <n>      运行时长 (默认 5)\n");
     printf("  --bitrate <bps>    Opus 码率 (默认 16000)\n");
     printf("  --jb <ms>          抖动缓冲目标延迟 (默认 60)\n");
-    printf("  --loopback         本地自环验证（不经网络）\n");
-    printf("  --peer-test        双端信令配对测试（需先启动 signal_server）\n");
+    printf("\n模式（三选一）:\n");
+    printf("  --call             完整 1v1 通话：信令 + ICE + DTLS-SRTP + 双向音频\n");
+    printf("                     （两端真的互相传音频，这是最主要的用法）\n");
+    printf("  --loopback         本地自环验证（不经网络，验证媒体链路本身）\n");
+    printf("  --peer-test        仅信令配对（诊断用，不含真实媒体传输）\n");
+    printf("\n其他:\n");
     printf("  --verbose          打开调试日志\n");
 }
 
@@ -321,7 +328,10 @@ int main(int argc, char** argv) {
 
     if (argc <= 1) {
         usage();
-        printf("\n提示：先用 --loopback 验证本地媒体链路，再用 --peer-test 验证信令配对。\n");
+        printf("\n提示：\n");
+        printf("  --call       真正的 1v1 通话（信令 + ICE + DTLS-SRTP + 双向音频）\n");
+        printf("  --loopback   只验证本地媒体链路（不经网络）\n");
+        printf("  --peer-test  只验证信令配对（诊断用）\n");
         return 0;
     }
 
@@ -330,6 +340,19 @@ int main(int argc, char** argv) {
     printf("  信令 : %s\n", args.signal_url.c_str());
     printf("  房间 : %s\n", args.room.c_str());
 
+    // 优先级：--call（真实通话）> --loopback（本地自环）> --peer-test（仅信令）
+    if (args.call) {
+        CallOptions copt;
+        copt.signal_url = args.signal_url;
+        copt.room       = args.room;
+        copt.name       = args.name;
+        copt.seconds    = args.seconds;
+        copt.bitrate    = args.bitrate;
+        copt.jb_ms      = args.jb_target;
+        copt.audio_file = args.audio_file;
+        copt.out_file   = args.out_file;
+        return run_call(copt);
+    }
     if (args.loopback) {
         return run_loopback(args);
     }

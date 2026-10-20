@@ -137,14 +137,17 @@ std::string DtlsSrtpSession::compute_fingerprint() const {
     return s;
 }
 
-// ---------------- 握手 ----------------
-bool DtlsSrtpSession::handshake(DtlsTransport* transport, const Config& cfg) {
-    if (!transport) {
-        LOGE(kTag, "null transport");
-        return false;
+// ---------------- 第一阶段：准备（创建证书，可读指纹）----------------
+//
+// 拆出这一步的目的：真实通话中，双方必须**先交换证书指纹**（写进 offer/answer），
+// 然后才能握手。所以指纹必须在握手之前就能拿到。
+bool DtlsSrtpSession::prepare(bool is_client, int handshake_timeout_ms) {
+    if (ssl_) {
+        LOGW(kTag, "already prepared, ignoring");
+        return true;
     }
-    is_client_ = cfg.is_client;
-    peer_fingerprint_expected_ = normalize_fp(cfg.peer_fingerprint);
+    is_client_ = is_client;
+    handshake_timeout_ms_ = handshake_timeout_ms;
 
     // 1) 创建 SSL_CTX（DTLS，不用 TLS）
     ctx_ = SSL_CTX_new(DTLS_method());
@@ -163,7 +166,7 @@ bool DtlsSrtpSession::handshake(DtlsTransport* transport, const Config& cfg) {
     // 解决办法：显式开启 SSL_VERIFY_PEER 让 server 请求对端证书，
     // 并挂一个**始终放行**的 verify_callback —— 因为 WebRTC 不用 CA 链，
     // 自签名证书在标准校验下必然失败（unable to get local issuer certificate）。
-    // 真正的身份保证来自我们自己的"指纹比对"（见 handshake() 结尾）。
+    // 真正的身份保证来自我们自己的"指纹比对"（见 handshake） 。
     //
     // 注意：不要用 SSL_VERIFY_FAIL_IF_NO_PEER_CERT —— 实测它会直接让握手失败
     // （因为证书无法通过内置校验）。见 docs/02-pitfalls.md 坑 26。
@@ -197,19 +200,36 @@ bool DtlsSrtpSession::handshake(DtlsTransport* transport, const Config& cfg) {
     if (is_client_) SSL_set_connect_state(ssl_);
     else            SSL_set_accept_state(ssl_);
 
+    // 4) 计算自己的指纹 —— 此时就能读，供信令交换使用
     local_fingerprint_ = compute_fingerprint();
-    LOGI(kTag, "local fingerprint: %s", local_fingerprint_.c_str());
+    LOGI(kTag, "prepared (role=%s), local fingerprint: %s",
+         is_client_ ? "client/active" : "server/passive",
+         local_fingerprint_.c_str());
+    return true;
+}
 
-    // 4) 握手循环
-    if (!do_handshake_loop(transport, cfg.handshake_timeout_ms)) {
+// ---------------- 第二阶段：握手 + 校验 + 派生 SRTP 密钥 ----------------
+bool DtlsSrtpSession::handshake(DtlsTransport* transport,
+                                const std::string& peer_fingerprint) {
+    if (!transport) {
+        LOGE(kTag, "null transport");
+        return false;
+    }
+    // 兜底：调用方没 prepare 就自动 prepare（用默认角色 client）
+    if (!ssl_ && !prepare(is_client_, handshake_timeout_ms_)) return false;
+
+    peer_fingerprint_expected_ = normalize_fp(peer_fingerprint);
+
+    // 5) 握手循环
+    if (!do_handshake_loop(transport, handshake_timeout_ms_)) {
         LOGE(kTag, "handshake failed");
         return false;
     }
 
-    // 5) 取出对端证书指纹并校验
+    // 6) 取出对端证书指纹并校验
     //
     // 注意：这里用 refresh_peer_fingerprint() 读对端证书。
-    // 实测发现 client 侧能立即读到、server 侧有时为空 —— 
+    // 实测发现 client 侧能立即读到、server 侧有时为空 ——
     // 这是 DTLS 握手完成时机在两侧不完全对称导致的（不是库的 bug）。
     // 处理方式：握手完成后再刷新一次；若仍为空则如实记录为"未获取"，
     // 并明确警告（不静默通过）。见 docs/02-pitfalls.md 坑 26。
@@ -234,9 +254,16 @@ bool DtlsSrtpSession::handshake(DtlsTransport* transport, const Config& cfg) {
         LOGW(kTag, "no expected fingerprint provided, skipping verification");
     }
 
-    // 6) 导出密钥材料并建立 SRTP 会话
+    // 7) 导出密钥材料并建立 SRTP 会话
     return export_and_setup_srtp();
 }
+
+// ---------------- 一步到位（测试用）----------------
+bool DtlsSrtpSession::handshake(DtlsTransport* transport, const Config& cfg) {
+    if (!prepare(cfg.is_client, cfg.handshake_timeout_ms)) return false;
+    return handshake(transport, cfg.peer_fingerprint);
+}
+
 
 bool DtlsSrtpSession::do_handshake_loop(DtlsTransport* t, int timeout_ms) {
     const int64_t deadline = now_ms() + timeout_ms;
