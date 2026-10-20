@@ -140,6 +140,7 @@ const char* signal_type_name(SignalType t) {
         case SignalType::kPeerLeft:  return "peer_left";
         case SignalType::kPing:      return "ping";
         case SignalType::kStats:     return "stats";
+        case SignalType::kKeyframeRequest: return "keyframe_request";
         case SignalType::kError:     return "error";
         default:                     return "unknown";
     }
@@ -156,6 +157,7 @@ SignalType signal_type_from_name(const std::string& s) {
     if (s == "peer_left")  return SignalType::kPeerLeft;
     if (s == "ping")       return SignalType::kPing;
     if (s == "stats")      return SignalType::kStats;
+    if (s == "keyframe_request") return SignalType::kKeyframeRequest;
     if (s == "error")      return SignalType::kError;
     return SignalType::kUnknown;
 }

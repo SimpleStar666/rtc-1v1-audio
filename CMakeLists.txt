@@ -21,12 +21,15 @@ pkg_check_modules(NICE   REQUIRED nice)
 pkg_check_modules(LWS    REQUIRED libwebsockets)
 pkg_check_modules(GLIB   REQUIRED glib-2.0)
 pkg_check_modules(OPENSSL REQUIRED openssl)
+# VP8：WebRTC 强制实现的视频编解码器（RFC 7742），无专利授权问题
+pkg_check_modules(VPX REQUIRED vpx)
 
 message(STATUS "opus        : ${OPUS_VERSION}")
 message(STATUS "libsrtp2    : ${SRTP2_VERSION}")
 message(STATUS "libnice     : ${NICE_VERSION}")
 message(STATUS "libwebsockets: ${LWS_VERSION}")
 message(STATUS "openssl     : ${OPENSSL_VERSION}")
+message(STATUS "libvpx      : ${VPX_VERSION}")
 
 # ---------- 公共库 ----------
 add_library(rtc_common STATIC
@@ -42,10 +45,13 @@ add_library(rtc_media STATIC
   src/media/jitter_buffer.cpp
   src/media/virtual_device.cpp
   src/media/audio_pipeline.cpp
+  src/media/vp8_codec.cpp
+  src/media/video_device.cpp
+  src/media/video_pipeline.cpp
 )
 target_include_directories(rtc_media PUBLIC src)
-target_link_libraries(rtc_media PUBLIC rtc_common ${OPUS_LIBRARIES})
-target_include_directories(rtc_media PRIVATE ${OPUS_INCLUDE_DIRS})
+target_link_libraries(rtc_media PUBLIC rtc_common ${OPUS_LIBRARIES} ${VPX_LIBRARIES})
+target_include_directories(rtc_media PRIVATE ${OPUS_INCLUDE_DIRS} ${VPX_INCLUDE_DIRS})
 
 # ---------- 阶段 3：协议 ----------
 add_library(rtc_protocol STATIC
@@ -110,6 +116,14 @@ target_link_libraries(peer PRIVATE ${RTC_EXE_LINK}
 target_include_directories(peer PRIVATE
   ${OPUS_INCLUDE_DIRS} ${SRTP2_INCLUDE_DIRS} ${NICE_INCLUDE_DIRS}
   ${LWS_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+
+add_executable(vp8_test tests/vp8_test.cpp)
+target_link_libraries(vp8_test PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES} ${VPX_LIBRARIES})
+target_include_directories(vp8_test PRIVATE ${OPUS_INCLUDE_DIRS} ${VPX_INCLUDE_DIRS})
+
+add_executable(video_test tests/video_test.cpp)
+target_link_libraries(video_test PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES} ${VPX_LIBRARIES})
+target_include_directories(video_test PRIVATE ${OPUS_INCLUDE_DIRS} ${VPX_INCLUDE_DIRS})
 
 add_executable(weaknet_test tests/weaknet_test.cpp)
 target_link_libraries(weaknet_test PRIVATE ${RTC_EXE_LINK} ${OPUS_LIBRARIES})

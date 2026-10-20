@@ -29,6 +29,17 @@ struct CallOptions {
 
     // 是否播放声音（WSL 有 WSLg 音频转发，可以真的听到）
     bool        play_audio = true;
+
+    // ---- 视频（默认开启：音视频通话才是完整的 RTC）----
+    bool        video              = true;
+    int         video_width        = 320;
+    int         video_height       = 240;
+    int         video_fps          = 15;
+    int         video_bitrate_kbps = 400;
+    // 画面源：test:motion（默认，渐变+运动）/ test:bars（彩条）/ test:noise（噪声）
+    std::string video_source       = "test:motion";
+    // 非空则把解码后的视频帧落盘为 PPM（可用图片查看器打开，肉眼验证画面）
+    std::string video_sink_dir;
 };
 
 // 运行一次完整通话。返回 0 表示成功建链并传完音频。

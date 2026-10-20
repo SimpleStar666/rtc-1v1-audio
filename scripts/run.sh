@@ -204,6 +204,8 @@ do_test() {
   run "本地自环"        ./peer --loopback --seconds 2
   run "ICE 穿透(+Trickle)" ./ice_test --seconds 1
   run "DTLS-SRTP"       ./dtls_srtp_test
+  run "VP8 视频编解码"  ./vp8_test
+  run "视频管线"        ./video_test
   run "弱网对抗"        ./loss_protection_test
   run "指标统计"        ./metrics_test
   run "端到端(无丢包)"  ./e2e_test --seconds 2
@@ -281,6 +283,7 @@ do_call() {
   [ -f "$src_b" ] || src_b=""
 
   pkill -f signal_server 2>/dev/null; pkill -f "peer --call" 2>/dev/null; sleep 0.4
+  rm -rf /tmp/vsink_A /tmp/vsink_B; mkdir -p /tmp/vsink_A /tmp/vsink_B
   cd "$BUILD"
 
   echo -e "  ${C_D}[1/4] 启动信令服务器 (端口 $PORT)${C_0}"
@@ -293,7 +296,9 @@ do_call() {
   local secs=8
   echo -e "  ${C_D}[2/4] 端点 A（主叫，采集=扫频 200->3000Hz）${C_0}"
   local A_ARGS=(--call --signal "ws://127.0.0.1:$PORT" --room demo --name A
-                --seconds $secs --out /tmp/call_A.pcm)
+                --seconds $secs --out /tmp/call_A.pcm
+                --video-size 320x240 --video-fps 15 --video-kbps 400
+                --video-source test:bars --video-sink /tmp/vsink_A)
   [ -n "$src_a" ] && A_ARGS+=(--audio-file "$src_a")
   timeout $((secs+25)) ./peer "${A_ARGS[@]}" > /tmp/rtc_A.log 2>&1 &
   local PA=$!
@@ -301,7 +306,9 @@ do_call() {
 
   echo -e "  ${C_D}[3/4] 端点 B（被叫，采集=单音 440Hz）${C_0}"
   local B_ARGS=(--call --signal "ws://127.0.0.1:$PORT" --room demo --name B
-                --seconds $secs --out /tmp/call_B.pcm)
+                --seconds $secs --out /tmp/call_B.pcm
+                --video-size 320x240 --video-fps 15 --video-kbps 400
+                --video-source test:motion --video-sink /tmp/vsink_B)
   [ -n "$src_b" ] && B_ARGS+=(--audio-file "$src_b")
   timeout $((secs+25)) ./peer "${B_ARGS[@]}" > /tmp/rtc_B.log 2>&1 &
   local PB=$!
@@ -335,6 +342,27 @@ do_call() {
     printf "发送 %-4s 包 / 接收 %-4s 包 / SRTP 解密 %s
 " "${sent:-?}" "${recv:-?}" "${srtp:-?}"
   done
+
+  # ---- 视频统计 ----
+  echo ""
+  title "视频传输"
+  for side in A B; do
+    local vf=/tmp/rtc_${side}.log
+    printf "  %s 端: " "$side"
+    local venc vdec vdrop vkbps
+    venc=$(grep "采集/编码帧" "$vf" | grep -oE '[0-9]+ / [0-9]+' | head -1)
+    vdec=$(grep "解码/丢弃帧" "$vf" | grep -oE '[0-9]+ / [0-9]+' | head -1)
+    vkbps=$(grep "发送分片" "$vf" | grep -oE '实测 [0-9]+ kbps' | head -1)
+    printf "编码 %-12s 解码/丢弃 %-12s %s\n" "${venc:-?}" "${vdec:-?}" "${vkbps:-}"
+  done
+  # 解码帧落盘数量
+  local na nb
+  na=$(ls /tmp/vsink_A/*.ppm 2>/dev/null | wc -l)
+  nb=$(ls /tmp/vsink_B/*.ppm 2>/dev/null | wc -l)
+  echo "  解码帧落盘: A 端收到 $na 帧 / B 端收到 $nb 帧（PPM）"
+  if [ "$na" -gt 0 ] && [ "$nb" -gt 0 ]; then
+    ok "视频双向传输成功（可用图片查看器打开 /tmp/vsink_*/*.ppm）"
+  fi
 
   echo ""
   if grep -q "✅ 通话成功" /tmp/rtc_A.log && grep -q "✅ 通话成功" /tmp/rtc_B.log; then
@@ -467,7 +495,7 @@ do_help() {
   printf '  %b%-10s%b 只编译\n'                             "$C_Y" "build"    "$C_0"
   printf '  %b%-10s%b 跑全部 9 项测试并汇总\n'              "$C_Y" "test"     "$C_0"
   printf '  %b%-10s%b 本地自环 —— %b能听到解码后的声音%b\n' "$C_Y" "loopback" "$C_0" "$C_G" "$C_0"
-  printf '  %b%-10s%b 双端真实通话（起服务器 + A/B 配对）\n' "$C_Y" "call"    "$C_0"
+  printf '  %b%-10s%b 双端音视频通话（起服务器 + A/B 配对，含 VP8 视频）\n' "$C_Y" "call" "$C_0"
   printf '  %b%-10s%b 弱网矩阵（丢包 0/2/5/8/15%%）\n'      "$C_Y" "weaknet"  "$C_0"
   printf '  %b%-10s%b 生成测试音频（PCM 用于 --audio-file，WAV 用于试听）\n' "$C_Y" "audio" "$C_0"
   printf '  %b%-10s%b 环境自检\n'                           "$C_Y" "env"      "$C_0"
@@ -480,6 +508,8 @@ do_help() {
   echo "  ./ice_test --seconds 3                          ICE 穿透 + Trickle ICE"
   echo "  ./ice_test --stun stun.l.google.com --stun-port 19302 --seconds 2"
   echo "  ./dtls_srtp_test                                DTLS-SRTP（21 项）"
+  echo "  ./vp8_test                                      VP8 编解码（PSNR/关键帧/码率）"
+  echo "  ./video_test                                    视频管线（分片/重组/PLI）"
   echo "  ./loss_protection_test                          NACK/FEC/拥塞控制"
   echo "  ./metrics_test                                  指标统计"
   echo "  ./e2e_test --seconds 4                          完整链路（加密+ICE）"

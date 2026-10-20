@@ -36,6 +36,14 @@ struct Args {
     bool        loopback = false;           // 本地自环：不经过网络
     bool        peer_test = false;          // 仅信令配对（诊断用）
     bool        call = false;               // 完整通话（真实媒体传输）
+    // 视频
+    bool        video = true;
+    int         video_w = 320;
+    int         video_h = 240;
+    int         video_fps = 15;
+    int         video_kbps = 400;
+    std::string video_source = "test:motion";
+    std::string video_sink;
 };
 
 Args parse(int argc, char** argv) {
@@ -53,6 +61,16 @@ Args parse(int argc, char** argv) {
         else if (k == "--loopback") a.loopback = true;
         else if (k == "--peer-test") a.peer_test = true;
         else if (k == "--call") a.call = true;
+        else if (k == "--no-video") a.video = false;
+        else if (k == "--video-size" && i + 1 < argc) {
+            const char* sz = argv[++i];
+            const char* x = strchr(sz, 'x');
+            if (x) { a.video_w = atoi(sz); a.video_h = atoi(x + 1); }
+        }
+        else if (k == "--video-fps" && i + 1 < argc) a.video_fps = atoi(argv[++i]);
+        else if (k == "--video-kbps" && i + 1 < argc) a.video_kbps = atoi(argv[++i]);
+        else if (k == "--video-source" && i + 1 < argc) a.video_source = argv[++i];
+        else if (k == "--video-sink" && i + 1 < argc) a.video_sink = argv[++i];
         else if (k == "--verbose") set_log_level(LogLevel::kDebug);
     }
     return a;
@@ -73,6 +91,13 @@ void usage() {
     printf("                     （两端真的互相传音频，这是最主要的用法）\n");
     printf("  --loopback         本地自环验证（不经网络，验证媒体链路本身）\n");
     printf("  --peer-test        仅信令配对（诊断用，不含真实媒体传输）\n");
+    printf("\n视频（默认开启）:\n");
+    printf("  --no-video         关闭视频（只跑音频）\n");
+    printf("  --video-size WxH   分辨率 (默认 320x240)\n");
+    printf("  --video-fps <n>    帧率 (默认 15)\n");
+    printf("  --video-kbps <n>   视频码率 (默认 400)\n");
+    printf("  --video-source <s> 画面源: test:motion|test:bars|test:noise (默认 motion)\n");
+    printf("  --video-sink <dir> 把解码帧落盘为 PPM (便于肉眼查看画面)\n");
     printf("\n其他:\n");
     printf("  --verbose          打开调试日志\n");
 }
@@ -351,6 +376,13 @@ int main(int argc, char** argv) {
         copt.jb_ms      = args.jb_target;
         copt.audio_file = args.audio_file;
         copt.out_file   = args.out_file;
+        copt.video              = args.video;
+        copt.video_width        = args.video_w;
+        copt.video_height       = args.video_h;
+        copt.video_fps          = args.video_fps;
+        copt.video_bitrate_kbps = args.video_kbps;
+        copt.video_source       = args.video_source;
+        copt.video_sink_dir     = args.video_sink;
         return run_call(copt);
     }
     if (args.loopback) {

@@ -24,6 +24,14 @@ enum class SignalType : uint8_t {
     kPeerLeft, // 服务端 -> 客户端：对端离开
     kPing,     // 应用层心跳
     kStats,    // 统计上报
+    // 视频关键帧请求 —— 对应 WebRTC 的 RTCP PLI / FIR
+    //
+    // 为什么走信令而不是媒体通道：
+    //   媒体通道是 UDP，PLI 本身也可能丢；而且"请求关键帧"是低频控制消息，
+    //   走可靠的信令（WebSocket/TCP）更合适。
+    //   真实 WebRTC 走 RTCP（与 RTP 复用同一条通道但有独立的可靠性机制），
+    //   本项目为简化把它放在信令层 —— 语义等价，路径不同。
+    kKeyframeRequest,
     kError,    // 错误
 };
 
