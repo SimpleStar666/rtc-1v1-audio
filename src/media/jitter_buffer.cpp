@@ -24,6 +24,19 @@ JitterBuffer::JitterBuffer(const Config& cfg) : cfg_(cfg) {
     stats_.cur_target_ms = cfg_.target_delay_ms;
 }
 
+// 运行时重新配置（不重建对象）。
+// 为什么需要它：JitterBuffer 含 std::mutex，mutex 删除了拷贝/移动，
+// 导致整个类不可赋值。而 AudioPipeline 的 jb_ 是成员（构造时用默认配置），
+// 真正配置要等 init() 才知道 —— 只能"在对象上改配置"，不能"换一个对象"。
+// 见 docs/02-pitfalls.md 坑 39。
+void JitterBuffer::set_config(const Config& cfg) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    cfg_ = cfg;
+    cfg_.target_delay_ms = std::max(cfg_.min_delay_ms,
+                          std::min(cfg_.max_delay_ms, cfg_.target_delay_ms));
+    stats_.cur_target_ms = cfg_.target_delay_ms;
+}
+
 // 计算序列号差值，处理 16bit 回绕
 int16_t JitterBuffer::seq_diff(uint16_t a, uint16_t b) {
     return static_cast<int16_t>(a - b);
@@ -83,6 +96,8 @@ void JitterBuffer::adapt_target_delay() {
 }
 
 bool JitterBuffer::push(uint16_t seq, const uint8_t* payload, size_t len, int64_t arrive_ms) {
+    // 锁：push 来自 ICE 接收回调线程，与播放线程的 pop 并发（坑 39）
+    std::lock_guard<std::mutex> lk(mutex_);
     if (arrive_ms < 0) arrive_ms = now_ms();
 
     // ---- 重复检测 ----
@@ -141,6 +156,7 @@ bool JitterBuffer::push(uint16_t seq, const uint8_t* payload, size_t len, int64_
 }
 
 bool JitterBuffer::ready_to_play(int64_t now) const {
+    std::lock_guard<std::mutex> lk(mutex_);
     if (playing_) return true;
     if (queue_.size() < min_playout_frames_) return false;   // 先攒够帧
     const int64_t t = (now < 0) ? now_ms() : now;
@@ -149,6 +165,8 @@ bool JitterBuffer::ready_to_play(int64_t now) const {
 }
 
 bool JitterBuffer::pop(std::vector<uint8_t>* payload, int64_t now) {
+    // 锁：pop 在播放线程，与网络回调线程的 push 并发（坑 39）
+    std::lock_guard<std::mutex> lk(mutex_);
     payload->clear();
 
     if (!have_seq_) return false;
@@ -195,10 +213,23 @@ bool JitterBuffer::pop(std::vector<uint8_t>* payload, int64_t now) {
 }
 
 void JitterBuffer::advance_play_clock() {
+    std::lock_guard<std::mutex> lk(mutex_);
     play_deadline_ms_ += cfg_.frame_ms;
 }
 
+// stats() 按值返回：避免调用方在锁外读到正在被修改的 stats_
+JitterBuffer::Stats JitterBuffer::stats() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return stats_;
+}
+
+size_t JitterBuffer::depth() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return queue_.size();
+}
+
 void JitterBuffer::reset() {
+    std::lock_guard<std::mutex> lk(mutex_);
     queue_.clear();
     have_seq_ = false;
     have_last_ = false;
@@ -216,6 +247,7 @@ void JitterBuffer::reset() {
 }
 
 JitterBuffer::Stats JitterBuffer::snapshot() const {
+    std::lock_guard<std::mutex> lk(mutex_);
     Stats s = stats_;
     s.queue_depth = queue_.size();
     s.cur_target_ms = cfg_.target_delay_ms;

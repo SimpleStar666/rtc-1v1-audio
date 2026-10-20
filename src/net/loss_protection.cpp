@@ -160,8 +160,14 @@ bool FecEncoder::add_source(uint16_t seq, const uint8_t* payload, size_t len,
     size_t max_len = 0;
     for (const auto& p : group_payloads_) max_len = std::max(max_len, p.size());
 
-    // 格式：[u16 base_seq][u16 count][u8 各源包长度...][XOR payload]
-    const size_t hdr = 2 + 2 + size_t(count_in_group_);
+    // 格式：[u16 base_seq][u16 count][u16 各源包长度...][XOR payload]
+    //
+    // ★ 长度字段必须是 u16，不能是 u8。
+    //   60ms 聚合包在 48kbps 时用户载荷约 360 字节 > 255，
+    //   用 u8 会被**静默截断**，接收端按错误长度切分 → FEC 恢复出垃圾数据。
+    //   低码率（16kbps 约 120 字节）下不会暴露，所以早期测试没抓到。
+    //   见 docs/02-pitfalls.md 坑 40。
+    const size_t hdr = 2 + 2 + 2 * size_t(count_in_group_);
     std::vector<uint8_t> xored(max_len, 0);
     for (size_t i = 0; i < group_payloads_.size(); i++) {
         for (size_t b = 0; b < group_payloads_[i].size(); b++) {
@@ -173,7 +179,7 @@ bool FecEncoder::add_source(uint16_t seq, const uint8_t* payload, size_t len,
     put_u16_le(fec_out->data(), group_base_seq_);
     put_u16_le(fec_out->data() + 2, uint16_t(count_in_group_));
     for (size_t i = 0; i < group_payloads_.size(); i++) {
-        (*fec_out)[4 + i] = uint8_t(group_payloads_[i].size());
+        put_u16_le(fec_out->data() + 4 + 2 * i, uint16_t(group_payloads_[i].size()));
     }
     memcpy(fec_out->data() + hdr, xored.data(), max_len);
 
@@ -209,9 +215,9 @@ void FecDecoder::on_fec(const uint8_t* fec_pkt, size_t len,
     // 读出各源包长度，算出 XOR 载荷长度
     size_t max_len = 0;
     for (size_t i = 0; i < count; i++) {
-        max_len = std::max<size_t>(max_len, fec_pkt[4 + i]);
+        max_len = std::max<size_t>(max_len, get_u16_le(fec_pkt + 4 + 2 * i));
     }
-    const size_t hdr = 4 + size_t(count);
+    const size_t hdr = 4 + 2 * size_t(count);
     if (len < hdr + max_len) { stats_.unusable++; return; }
 
     // 统计组内已有哪些源包、缺哪些
@@ -233,7 +239,7 @@ void FecDecoder::on_fec(const uint8_t* fec_pkt, size_t len,
             for (size_t b = 0; b < it->second.size(); b++) rec[b] ^= it->second[b];
         }
         // 按该包原始长度截断
-        const uint16_t need_len = fec_pkt[4 + (missing[0] - base_seq)];
+        const uint16_t need_len = get_u16_le(fec_pkt + 4 + 2 * size_t(missing[0] - base_seq));
         if (rec.size() > need_len) rec.resize(need_len);
 
         src_[missing[0]] = rec;

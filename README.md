@@ -120,7 +120,7 @@ paplay /tmp/call_A.wav
 | [**docs/05-code-tour.md**](docs/05-code-tour.md) | **代码导读：每个功能怎么实现、代码在哪、为什么这么写** |
 | [docs/00-architecture.md](docs/00-architecture.md) | 整体架构、数据流、包格式与 RTP 的映射 |
 | [docs/01-progress-log.md](docs/01-progress-log.md) | 开发进度与重点记录（每步做了什么、学到什么） |
-| [docs/02-pitfalls.md](docs/02-pitfalls.md) | **踩坑记录（38 项，含真实报错与解法）** |
+| [docs/02-pitfalls.md](docs/02-pitfalls.md) | **踩坑记录（41 项，含真实报错与解法）** |
 | [docs/03-verification.md](docs/03-verification.md) | **验证数据与实测结果** |
 
 ## 构建

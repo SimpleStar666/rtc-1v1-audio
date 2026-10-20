@@ -31,7 +31,12 @@ bool AudioPipeline::init(const Config& cfg, VirtualAudioDevice* device) {
     JitterBuffer::Config jcfg;
     jcfg.target_delay_ms = cfg.jb_target_ms;
     jcfg.frame_ms = cfg.frame_ms;
-    jb_ = JitterBuffer(jcfg);
+    // 注意：不能写 `jb_ = JitterBuffer(jcfg)` —— JitterBuffer 内含 std::mutex，
+    // 而 mutex 删除了拷贝/移动，所以 JitterBuffer 是**不可赋值**类型。
+    // jb_ 是成员、早已构造，配置又要等到 init() 才知道，
+    // 所以改用 set_config() 在**原有对象上**重新配置（不重建对象）。
+    // 见 docs/02-pitfalls.md 坑 39。
+    jb_.set_config(jcfg);
     jb_.reset();
 
     LOGI(kTag, "init: session=%d, bitrate=%dbps, frame=%dms, aggregate=%d frames, jb_target=%dms",
@@ -259,8 +264,16 @@ int AudioPipeline::bitrate_kbps() const {
 }
 
 void AudioPipeline::set_target_bitrate_bps(int bps) {
-    LOGI(kTag, "target bitrate -> %d bps", bps);
-    // 简化：重建编码器代价高，这里仅记录；真实实现应支持运行时调整
+    // ★ 曾经这里只打日志、不真正生效（"简化：仅记录"）。
+    //   那等于拥塞控制算出了目标码率却没人执行 —— 自适应成了空转。
+    //   Opus 支持运行时改码率（OPUS_SET_BITRATE_REQUEST），直接调即可，
+    //   不需要重建编码器。
+    //   见 docs/02-pitfalls.md 坑 41。
+    if (codec_.set_bitrate(bps)) {
+        LOGI(kTag, "target bitrate -> %d bps (applied to encoder)", bps);
+    } else {
+        LOGW(kTag, "set_target_bitrate_bps(%d) failed", bps);
+    }
 }
 
 AudioPipeline::Report AudioPipeline::report() const {

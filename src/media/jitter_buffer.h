@@ -16,6 +16,7 @@
 //   本项目做帧级粗调（调整目标延迟 + 丢包隐藏 PLC），更简单但同类问题
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <vector>
 
 #include "common/util.h"
@@ -33,6 +34,12 @@ public:
 
     JitterBuffer();                      // 使用默认 Config
     explicit JitterBuffer(const Config& cfg);
+
+    // 运行时重新配置（不重建对象）。
+    // 提供它是因为 JitterBuffer 含 std::mutex → 不可拷贝/移动，
+    // 而 AudioPipeline 的 jb_ 是成员、配置要等 init() 才知道。
+    // 见 docs/02-pitfalls.md 坑 39。
+    void set_config(const Config& cfg);
 
     struct Stats {
         uint64_t received = 0;      // 收到的包
@@ -68,9 +75,14 @@ public:
     // 推进播放时钟（每消费一帧调一次）
     void advance_play_clock();
 
-    const Stats& stats() const { return stats_; }
+    // ★ 注意：这里是**按值返回**，不是返回引用。
+    //   返回 const 引用会让调用方在锁外读到正在被另一线程修改的 stats_，
+    //   是典型的"看似线程安全实则不是"。要读统计请用 stats()（加锁拷贝）
+    //   或 snapshot()。见 docs/02-pitfalls.md 坑 39。
+    Stats stats() const;
+
     void  reset();
-    size_t depth() const { return queue_.size(); }
+    size_t depth() const;   // 加锁（读 queue_.size()）
 
     // 统计数据快照（便于上报）
     Stats snapshot() const;
@@ -120,6 +132,21 @@ private:
     int      recent_count_ = 0;
 
     Stats    stats_;
+
+    // ★ 线程安全：push 和 pop 来自不同线程，必须有锁。
+    //
+    //   真实通话时：
+    //     push() ← AudioPipeline::on_media_packet() ← ICE 接收回调（libnice glib 线程）
+    //     pop()  ← AudioPipeline::playout_loop()    ← 播放线程
+    //   两者并发访问 queue_ / stats_ / 各种水位变量（std::deque、纯整数），
+    //   无锁时是**数据竞争**：轻则统计错乱，重则 deque 内部指针被破坏而崩溃。
+    //
+    //   早期版本没有锁 —— 因为最初只在 loopback（近似单线程）下跑，
+    //   低负载把问题掩盖了；接上真实 ICE 通道后才暴露风险。
+    //   见 docs/02-pitfalls.md 坑 39。
+    //
+    //   注意：mutable 是为了让 const 方法（snapshot/depth/ready_to_play）也能加锁。
+    mutable std::mutex mutex_;
 };
 
 }  // namespace rtc
