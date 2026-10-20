@@ -148,6 +148,8 @@ private:
     Report rep_;
     int64_t send_start_ms_ = 0;
     uint16_t next_frame_id_ = 0;
+    // 自启动以来编码了多少帧（用于"启动关键帧密集期"判断）
+    int64_t  frames_since_start_ = 0;
     int64_t last_kf_req_ms_ = 0;
 
     // 是否已经成功解出过至少一个关键帧。

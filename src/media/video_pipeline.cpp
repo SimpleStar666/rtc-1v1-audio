@@ -143,6 +143,24 @@ void VideoPipeline::send_loop() {
             rep_.frames_captured++;
         }
 
+        // ★ 启动阶段的关键帧密集期（"initial keyframe burst"）。
+        //
+        //   问题：接收端刚加入时，如果恰好错过一个周期性关键帧，
+        //   就要等到下一个（本实现 kf_max_dist = fps*2，即最多 2 秒），
+        //   这段时间画面全黑。实测加压 10 轮会有 3 轮出现"固定丢 9 帧"。
+        //
+        //   为什么不能只靠 PLI：PLI 需要一次往返，而且**首次** PLI 经常会白丢
+        //   （对端管线还没起来 / 信令那一刻对端还没进房）。
+        //
+        //   做法（WebRTC 也是这么做的）：通话开始的头 1 秒内，每 5 帧强制一个
+        //   关键帧。这样接收端无论何时就绪，最多等 ~330ms 就能拿到可解码起点。
+        //   代价：头 1 秒码率略高（关键帧是 P 帧的 3 倍左右），可接受。
+        const int64_t elapsed_ms = now_ms() - send_start_ms_;
+        if (elapsed_ms < 1000 and (frames_since_start_ % 5) == 0) {
+            codec_.request_keyframe();
+        }
+        frames_since_start_++;
+
         EncodedFrame ef;
         if (!codec_.encode(frame, &ef) || ef.data.empty()) {
             continue;
@@ -311,6 +329,7 @@ void VideoPipeline::on_video_fragment(const PacketHeader& h,
 void VideoPipeline::assemble_and_decode(uint16_t frame_id) {
     std::vector<uint8_t> data;
     bool is_key = false;
+    bool need_kf_from_skip = false;
     {
         std::lock_guard<std::mutex> lk(rx_mutex_);
         auto it = pending_.find(frame_id);
@@ -336,17 +355,30 @@ void VideoPipeline::assemble_and_decode(uint16_t frame_id) {
 
         // ★ 视频特有的判断：如果之前丢过关键帧，且当前帧不是关键帧，
         //   那么这一帧必然解不出来（参考帧链断了）。
-        //   直接丢弃，并请求关键帧 —— 而不是浪费 CPU 去解一个必然失败的帧。
+        //   直接丢弃 —— 而不是浪费 CPU 去解一个必然失败的帧。
         if (!is_key && !lost_keyframe_until_.empty()) {
             const uint16_t last_lost = *lost_keyframe_until_.rbegin();
             if (int16_t(frame_id - last_lost) > 0) {
-                std::lock_guard<std::mutex> lk2(stat_mutex_);
-                rep_.frames_dropped++;
-                // 落在这里说明还在等关键帧，本次不解码
-                // （关键帧请求由 on_video_fragment 的超时路径或解码失败路径触发）
+                {
+                    std::lock_guard<std::mutex> lk2(stat_mutex_);
+                    rep_.frames_dropped++;
+                }
+                // ★ 这里也必须（限流地）请求关键帧。
+                //   早期版本只丢弃、不请求，寄希望于"之前的 PLI 已经送到了"。
+                //   但 PLI 是可能丢的（启动时对端还没就绪、或信令那一刻正好断），
+                //   一旦丢了，接收端就在"等一个永远不会来的关键帧"里永久卡住。
+                //   实测：加压 5 轮仍有 1 轮固定丢 9 帧，就是这条路径没请求造成的。
+                //   见 docs/02-pitfalls.md 坑 47。
+                need_kf_from_skip = true;
                 return;
             }
         }
+    }
+
+    // 锁外触发（上面 skip 路径打的标记）
+    if (need_kf_from_skip) {
+        request_keyframe_throttled();
+        return;
     }
 
     YuvFrame out;

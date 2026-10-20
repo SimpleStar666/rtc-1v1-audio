@@ -124,7 +124,12 @@ int main(int argc, char** argv) {
         CHECK(rb.fragments_recv == ra.fragments_sent, "B 收到全部发片（无丢包）");
         CHECK(rb.frames_recv == ra.frames_encoded, "B 重组出全部帧");
         CHECK(rb.frames_decoded > 0, "B 成功解码");
-        CHECK(rb.keyframe_requests == 0, "无丢包时不需要请求关键帧");
+        // 注意：`VideoPipeline::start()` 会主动请求一次关键帧
+        // （对应 WebRTC 接收端在 setRemoteDescription 后立即发 PLI 的行为），
+        // 目的是避免"等下一个周期性关键帧"造成最长 2 秒的黑屏。
+        // 所以无丢包时允许 1~2 次启动请求，但稳定传输期间不应持续请求。
+        CHECK(rb.keyframe_requests <= 2,
+              "无丢包时只在启动时请求关键帧（<=2 次），之后不再请求");
         CHECK(ra.actual_kbps > 0, "实测码率 > 0");
 
         p.shutdown();

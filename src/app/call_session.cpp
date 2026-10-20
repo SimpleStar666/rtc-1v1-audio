@@ -527,7 +527,13 @@ int run_call(const CallOptions& opt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(kTickMs));
 
         // 控制消息泵（每 100ms 检查一次）：处理对端的关键帧请求
-        if (need_keyframe.exchange(false) && video_active.load()) {
+        //
+        // 注意判断顺序：**先判断 video_active，再清 flag**。
+        // 若写成 `need_keyframe.exchange(false) && video_active.load()`，
+        // exchange 会先把 flag 清掉，video 未激活时这个请求就被静默吞了 ——
+        // 对端会一直等一个永远不会来的关键帧。见 docs/02-pitfalls.md 坑 47。
+        if (video_active.load() && need_keyframe.load()) {
+            need_keyframe.store(false);
             vpipe.on_keyframe_request();
         }
 
