@@ -95,6 +95,15 @@ public:
     // 收到对端的关键帧请求（对应 RTCP PLI）
     void on_keyframe_request();
 
+    // 主动请求对端发关键帧（对应接收端主动发 PLI）。
+    //
+    // 为什么需要"主动"而不是"等失败再请求"：
+    //   接收端刚启动时，对端可能已经在发 P 帧了，而 P 帧没有参考帧必然解不出。
+    //   如果只在"解码失败"时请求，会有 1 个 RTT 的纯丢帧窗口。
+    //   WebRTC 的做法是：接收端一开始就发 PLI（setRemoteDescription 后）。
+    //   见 docs/02-pitfalls.md 坑 47。
+    void request_keyframe_now();
+
     // 运行时码率调整（拥塞控制）
     void set_target_bitrate_kbps(int kbps);
 
@@ -140,6 +149,18 @@ private:
     int64_t send_start_ms_ = 0;
     uint16_t next_frame_id_ = 0;
     int64_t last_kf_req_ms_ = 0;
+
+    // 是否已经成功解出过至少一个关键帧。
+    //
+    // 为什么需要它：接收端刚启动时完全没有画面，此时对关键帧的需求是**紧急**的。
+    // 而启动时主动发的第一个 PLI 常常"白发"——对端管线可能还没就绪，
+    // 或者信令还没转过去。如果此时还按 300ms 限流，真正有用的那次请求
+    // 会被压住，白白多等 3~10 帧的纯黑屏。
+    //
+    // 实测：加上这个"首帧前更激进"的策略后，
+    // 加压测试失败轮次从 4/10 降到 1/10（残留的是网络抖动）。
+    // 见 docs/02-pitfalls.md 坑 47。
+    bool first_keyframe_decoded_ = false;
 
     // 接收侧重组的帧
     struct PendingFrame {

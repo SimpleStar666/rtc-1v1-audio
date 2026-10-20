@@ -436,6 +436,9 @@ bool DtlsSrtpSession::export_and_setup_srtp() {
 bool DtlsSrtpSession::protect(uint8_t* rtp, int* len) {
     if (!srtp_out_) return false;
 
+    // 锁：可能被音频发送线程与视频发送线程并发调用（见头文件说明）
+    std::lock_guard<std::mutex> lk(srtp_out_mutex_);
+
     int out_len = *len;
     srtp_err_status_t st = srtp_protect(srtp_out_, rtp, &out_len);
     if (st != srtp_err_status_ok) {
@@ -450,6 +453,9 @@ bool DtlsSrtpSession::protect(uint8_t* rtp, int* len) {
 
 bool DtlsSrtpSession::unprotect(uint8_t* srtp, int* len) {
     if (!srtp_in_) return false;
+
+    // 锁：在 libnice 的 glib 网络线程调用，与发送侧并发（见头文件说明）
+    std::lock_guard<std::mutex> lk(srtp_in_mutex_);
 
     int out_len = *len;
     srtp_err_status_t st = srtp_unprotect(srtp_in_, srtp, &out_len);

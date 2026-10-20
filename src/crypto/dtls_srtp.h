@@ -17,6 +17,7 @@
 //   4. 按 RFC 5764 切成 client/server 的 master key + salt
 //   5. 用 libsrtp2 创建 SRTP 会话，后续 RTP 走 srtp_protect / srtp_unprotect
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -126,6 +127,23 @@ private:
 
     srtp_t srtp_in_ = nullptr;    // 解密（接收方向）
     srtp_t srtp_out_ = nullptr;   // 加密（发送方向）
+
+    // ★ libsrtp 的 srtp_t 会话**不是线程安全的**。
+    //
+    //   本项目里 protect() 会被两个线程调用（音频发送线程 + 视频发送线程），
+    //   unprotect() 会被第三个线程调用（libnice 的 glib 网络线程）。
+    //   并发进入同一 srtp_t 会破坏其内部重放窗口/序列号状态，
+    //   输出**损坏的密文**——接收端解密"成功"但拿到的是垃圾，
+    //   表现为解码器报 "Bitstream not supported by this decoder"。
+    //
+    //   实测：5 轮音视频通话有 2~3 轮 A 端全部视频帧解码失败（间歇性）。
+    //   纯音频时只有 1 个发送线程，所以从来没暴露过。
+    //   见 docs/02-pitfalls.md 坑 45。
+    //
+    //   收发方向用的是两个独立的 srtp_t，所以用两把锁，
+    //   收发可以并发（不互相阻塞）。
+    mutable std::mutex srtp_out_mutex_;   // 保护 srtp_out_（加密）
+    mutable std::mutex srtp_in_mutex_;    // 保护 srtp_in_ （解密）
 
     bool        is_client_ = true;
     int         handshake_timeout_ms_ = 10000;

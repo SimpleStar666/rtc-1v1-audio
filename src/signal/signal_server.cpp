@@ -216,6 +216,13 @@ void on_message(struct lws* wsi, const std::string& text) {
         case SignalType::kAnswer:
             handle_forward(wsi, s, m, "answer");
             break;
+        case SignalType::kKeyframeRequest:
+            // 视频关键帧请求（对应 RTCP PLI）——必须转发给对端，
+            // 否则接收端丢帧后永远等不到新关键帧，画面永久卡死。
+            // 这是实测发现的漏洞：服务器 switch 只处理 join/offer/answer/candidate，
+            // PLI 被静默丢弃 → 对端"收到 0 次"。见 docs/02-pitfalls.md 坑 46。
+            if (s->in_room) handle_forward(wsi, s, m, "keyframe_request");
+            break;
         case SignalType::kCandidate:
             handle_forward(wsi, s, m, "candidate");
             break;

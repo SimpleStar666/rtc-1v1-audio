@@ -16,6 +16,10 @@ constexpr const char* kTag = "vpipe";
 // 反而把带宽挤占掉（WebRTC 里 PLI 也有限流，通常 500ms~1s）。
 constexpr int64_t kMinKeyframeReqIntervalMs = 300;
 
+// "屏幕还黑着"时用的紧急间隔。比常规间隔激进，但仍有下限，
+// 避免对端还没就绪时把自己刷成请求风暴。
+constexpr int64_t kUrgentKeyframeReqIntervalMs = 100;
+
 // 重组超时：一帧的分片如果这么久还没凑齐，就放弃（后续帧已到，没必要等）
 constexpr int64_t kReassembleTimeoutMs = 300;
 }  // namespace
@@ -35,8 +39,16 @@ constexpr int64_t kReassembleTimeoutMs = 300;
 void VideoPipeline::request_keyframe_throttled() {
     if (!kf_req_fn_) return;
     const int64_t now = now_ms();
+
+    // 间隔是动态的：
+    //   - 还没解出过任何关键帧 → 100ms（紧急：屏幕是黑的，每帧都亏）
+    //   - 已经在正常播放     → 300ms（够用，避免请求风暴）
+    const int64_t interval = first_keyframe_decoded_
+                                 ? kMinKeyframeReqIntervalMs
+                                 : kUrgentKeyframeReqIntervalMs;
+
     // last_kf_req_ms_ == 0 表示"从未请求过"，此时直接放行并建立基准
-    if (last_kf_req_ms_ != 0 && now - last_kf_req_ms_ < kMinKeyframeReqIntervalMs) {
+    if (last_kf_req_ms_ != 0 && now - last_kf_req_ms_ < interval) {
         return;   // 限流中
     }
     last_kf_req_ms_ = now;
@@ -89,7 +101,22 @@ void VideoPipeline::start() {
     send_start_ms_ = now_ms();
     kbps_window_ms_ = send_start_ms_;
     send_thread_ = std::thread([this] { send_loop(); });
+
+    // ★ 启动时主动请求一次关键帧（不等解码失败）。
+    //   否则接收端要等到"下一个周期性关键帧"才能出画面
+    //   （本实现 kf_max_dist = fps*2，即最多等 2 秒）。
+    //   实测：不加这一行，A 端会固定丢约 15 帧（1 秒）。
+    request_keyframe_now();
+
     LOGI(kTag, "started");
+}
+
+void VideoPipeline::request_keyframe_now() {
+    // 绕过限流：启动时的一次请求必然要发出去。
+    // 用 last_kf_req_ms_ = 0 作为"未请求过"的哨兵（与 throttled 版本一致）。
+    if (!kf_req_fn_) return;
+    last_kf_req_ms_ = 0;      // 清掉限流基准，确保这次一定发出
+    request_keyframe_throttled();
 }
 
 void VideoPipeline::stop() {
@@ -250,10 +277,26 @@ void VideoPipeline::on_video_fragment(const PacketHeader& h,
             // 已收到过
         } else {
             pf.got.insert(frag_index);
-            pf.frag_len[frag_index] = uint32_t(payload.size() - VideoFragmentHeader::kSize);
-            // 简化拼接：按片序追加（真实 RTP 按 offset 写入，这里片序到达即顺序）
-            pf.data.insert(pf.data.end(),
-                           payload.begin() + VideoFragmentHeader::kSize, payload.end());
+            const uint32_t flen = uint32_t(payload.size() - VideoFragmentHeader::kSize);
+            pf.frag_len[frag_index] = flen;
+
+            // ★ 关键修复：必须按 frag_index 写到"该片应该在的位置"，
+            //   不能用 `insert(end(), ...)` 按到达顺序追加。
+            //
+            //   为什么：UDP 不保证分片按序到达。若第 2 片比第 1 片先到，
+            //   按到达顺序追加就会把第 2 片的字节放在第 1 片前面，
+            //   拼出来的码流字节顺序错乱 → 解码器报
+            //   "Bitstream not supported by this decoder"。
+            //
+            //   这是本项目实测到的真 bug：5 轮通话里有 2 轮 A 端丢 29 帧，
+            //   原因正是乱序分片被拼错。见 docs/02-pitfalls.md 坑 45。
+            //
+            //   正确做法与 RTP 一致：按 offset 定位写入（等价于 RTP 的
+            //   fragment offset 语义），片内偏移 = frag_index × max_payload。
+            const size_t need = size_t(frag_index) * cfg_.max_fragment_payload + flen;
+            if (pf.data.size() < need) pf.data.resize(need, 0);
+            memcpy(pf.data.data() + size_t(frag_index) * cfg_.max_fragment_payload,
+                   payload.data() + VideoFragmentHeader::kSize, flen);
         }
 
         if (pf.got.size() == pf.frag_count) complete = true;
@@ -273,6 +316,15 @@ void VideoPipeline::assemble_and_decode(uint16_t frame_id) {
         auto it = pending_.find(frame_id);
         if (it == pending_.end()) return;
         data = std::move(it->second.data);
+
+        // 按最后一片的实际长度截断：因为按 offset 定位写入时，
+        // 缓冲区是按"片索引 × 固定片长"撑开的，末片通常不满，
+        // 后面会留一段补零的空白，必须裁掉，否则码流尾部有多余字节。
+        const uint16_t last_idx = uint16_t(it->second.frag_count - 1);
+        const size_t real_len =
+            size_t(last_idx) * cfg_.max_fragment_payload + it->second.frag_len[last_idx];
+        if (data.size() > real_len) data.resize(real_len);
+
         is_key = it->second.is_keyframe;
         pending_.erase(it);
 
@@ -315,8 +367,9 @@ void VideoPipeline::assemble_and_decode(uint16_t frame_id) {
                       double(now_ms() - send_start_ms_ + 1);
     }
 
-    // 成功解出关键帧后，清掉"等待关键帧"标记
+    // 成功解出关键帧后：清掉"等待关键帧"标记，并记录"已经有画面了"
     if (is_key) {
+        first_keyframe_decoded_ = true;
         std::lock_guard<std::mutex> lk(rx_mutex_);
         lost_keyframe_until_.clear();
     }

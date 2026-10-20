@@ -462,6 +462,12 @@ int run_call(const CallOptions& opt) {
             fprintf(stderr, "  ! 视频管线初始化失败，降级为纯音频\n");
             video_ready = false;
         } else {
+            // ★ 初始化完成就置 active —— 不要等到 start() 之后。
+            //   原因：ICE 接收回调靠 video_active 判断是否把分片交给视频管线。
+            //   若置得太晚，对端早到的分片（正好包含**首个关键帧**）会被静默丢弃，
+            //   表现为主叫端固定丢约 15 帧且不触发 PLI（因为根本没走到解码）。
+            //   见 docs/02-pitfalls.md 坑 47。
+            video_active = true;
             // 发送：视频分片 -> 序列化 -> SRTP 加密 -> ICE（与音频同一条通道）
             vpipe.set_send_fn([&](const PacketHeader& h,
                                   const std::vector<uint8_t>& payload) {
@@ -502,13 +508,32 @@ int run_call(const CallOptions& opt) {
         ? "（对端音频会被解码并播放，可以听到）"
         : "（未开启播放）");
 
-    // 实时进度：每秒打印一行
-    for (int s = 0; s < opt.seconds; s++) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        // 处理对端的关键帧请求（在通话主循环里做，不占信令回调线程）
+    // 实时进度：每秒打印一行。
+    //
+    // ★ 循环粒度是 100ms，不是 1s —— 这一点很关键。
+    //
+    //   这里除了打印统计，还兼任"控制消息泵"：处理对端发来的
+    //   关键帧请求（PLI）。如果循环是 1 秒一次，一个 PLI 最多要等
+    //   1 秒才被应用，期间接收端持续丢帧 —— 实测正好丢 15 帧
+    //   （15fps × 1s），表现为"主叫端固定丢 15 帧，被叫端 0 丢"。
+    //
+    //   控制消息的响应延迟应该由它的业务需要决定（PLI 希望 <1 帧），
+    //   而不是被"统计打印的频率"绑架。见 docs/02-pitfalls.md 坑 47。
+    const int kTickMs = 100;
+    const int kTicksPerSec = 1000 / kTickMs;   // 10
+    const long total_ticks = long(opt.seconds) * kTicksPerSec;
+
+    for (long tick = 0; tick < total_ticks; tick++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kTickMs));
+
+        // 控制消息泵（每 100ms 检查一次）：处理对端的关键帧请求
         if (need_keyframe.exchange(false) && video_active.load()) {
             vpipe.on_keyframe_request();
         }
+
+        // 只在整秒时打印统计
+        if ((tick + 1) % kTicksPerSec != 0) continue;
+        const int s = int((tick + 1) / kTicksPerSec) - 1;
 
         auto rep = pipe.report();
         if (video_active.load()) {
